@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Ruff
+.ruff_cache/
+
+# UV
+uv.lock
+
+# Debug outputs
+pipeline_debug*.json
+
+# Generated reports
+reports/
+
+# Test papers (PDFs with potential copyright)
+paper2test/
+
+# Claude local settings
+.claude/settings.local.json
