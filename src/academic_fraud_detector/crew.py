@@ -5,13 +5,12 @@ Uses the @CrewBase decorator pattern (CrewAI best practice).
 The crew uses Hierarchical process: Lead Investigator manages all specialists,
 dynamically delegating tasks and adjusting investigation depth.
 
-Current investigation dimensions (6 total, plagiarism disabled):
-1. Image Forensics (30%) — ELA, clone detection, cross-figure comparison
-2. Data Integrity (30%) — Benford, p-value, GRIM, statistical consistency
-3. Citation Manipulation (15%) — networkx graph analysis, self-citation
-4. Peer Review Fraud (10%) — text analysis, reviewer credentials
-5. Methodology Consistency (10%) — reagent verification, ethics check, timeline
-6. Productivity Anomaly (5%) — publication frequency, salami slicing
+Current local investigation dimensions:
+1. Raw Data Integrity — XLSX raw data, deterministic statistics, PDF/table alignment
+2. Methodology Consistency — reagent verification, ethics check, timeline
+
+Full/API mode still keeps legacy literature, citation, peer-review, productivity,
+and image-forensics components available, but local case mode does not run image processing.
 
 Usage:
     crew = AcademicFraudDetectionCrew().crew()
@@ -107,6 +106,9 @@ from .tools.web_search import (
     AcademicWebSearchTool,
     CitationExistenceCheckTool,
 )
+from .utils.case_folder import discover_case_folder
+from .utils.raw_data_loader import load_raw_data_files
+from .utils.raw_data_precheck import format_raw_data_precheck_for_agent, run_raw_data_precheck
 
 logger = logging.getLogger(__name__)
 
@@ -152,13 +154,15 @@ class AcademicFraudDetectionCrew:
         self._semantic_similarity = SemanticSimilarityTool()
         # lexical_plagiarism_check is a @tool-decorated function, passed directly
 
-        # Image forensics tools
-        self._ela = ELATool()
-        self._clone_detection = CloneDetectionTool()
-        self._ai_image = AIImageDetectionTool()
-        self._cross_image_duplicate = CrossImageDuplicateTool()
-        self._background_consistency = BackgroundConsistencyTool()
-        self._feature_duplicate = FeatureBasedDuplicateTool()
+        # Image forensics tools are kept for full/API mode only. Local case mode is
+        # raw-data-first and must not run image extraction, OCR, or panel comparison.
+        if not local_only:
+            self._ela = ELATool()
+            self._clone_detection = CloneDetectionTool()
+            self._ai_image = AIImageDetectionTool()
+            self._cross_image_duplicate = CrossImageDuplicateTool()
+            self._background_consistency = BackgroundConsistencyTool()
+            self._feature_duplicate = FeatureBasedDuplicateTool()
 
         # Statistical tools
         self._benford = BenfordLawTool()
@@ -168,10 +172,11 @@ class AcademicFraudDetectionCrew:
         self._statistical_consistency = StatisticalConsistencyTool()
         self._cross_figure_data = CrossFigureDataComparisonTool()
 
-        # OCR tools (for extracting numeric data from chart images)
-        self._chart_ocr = ChartOCRTool()
-        self._batch_chart_ocr = BatchChartOCRTool()
-        self._bar_chart_extract = BarChartExtractionTool()
+        # OCR tools are image-derived, so they are disabled in local-only mode.
+        if not local_only:
+            self._chart_ocr = ChartOCRTool()
+            self._batch_chart_ocr = BatchChartOCRTool()
+            self._bar_chart_extract = BarChartExtractionTool()
 
         # Citation tools
         if not local_only:
@@ -241,17 +246,23 @@ class AcademicFraudDetectionCrew:
 
     @agent
     def image_forensics_analyst(self) -> Agent:
-        """Image manipulation detection specialist."""
-        tools = [
-            self._ela,
-            self._clone_detection,
-            self._ai_image,
-            self._cross_image_duplicate,
-            self._background_consistency,
-            self._feature_duplicate,
-        ]
+        """Image manipulation detection specialist.
+
+        CrewBase resolves YAML task-agent references during construction, even when
+        local mode later excludes the image task. Keep this method local-safe without
+        instantiating or dereferencing image tools in local-only mode.
+        """
         if self._local_only:
-            tools.insert(0, self._local_paper_loader)
+            tools = [self._local_paper_loader]
+        else:
+            tools = [
+                self._ela,
+                self._clone_detection,
+                self._ai_image,
+                self._cross_image_duplicate,
+                self._background_consistency,
+                self._feature_duplicate,
+            ]
         return Agent(
             config=self.agents_config["image_forensics_analyst"],
             llm=_create_llm("AGENT_MODEL", "deepseek-chat"),
@@ -268,12 +279,15 @@ class AcademicFraudDetectionCrew:
             self._anomalous_precision,
             self._statistical_consistency,
             self._cross_figure_data,
-            self._chart_ocr,
-            self._batch_chart_ocr,
-            self._bar_chart_extract,
         ]
         if self._local_only:
             tools.insert(0, self._local_paper_loader)
+        else:
+            tools.extend([
+                self._chart_ocr,
+                self._batch_chart_ocr,
+                self._bar_chart_extract,
+            ])
         return Agent(
             config=self.agents_config["data_integrity_auditor"],
             llm=_create_llm("AGENT_MODEL", "deepseek-chat"),
@@ -438,8 +452,8 @@ class AcademicFraudDetectionCrew:
         """
         Assemble the investigation crew.
 
-        In local_only mode: focuses on data integrity + image forensics only.
-        (No plagiarism/citation/peer-review — those require external APIs.)
+        In local_only mode: focuses on PDF text/tables + XLSX raw-data integrity +
+        methodology consistency. Image processing is not executed.
 
         Uses Hierarchical process:
         - Lead Investigator is the manager (NOT in agents list)
@@ -448,28 +462,22 @@ class AcademicFraudDetectionCrew:
         manager = self.lead_investigator()
 
         if self._local_only:
-            # Only tasks that work with local content alone.
+            # Only tasks that work with local PDF text/tables and raw XLSX data.
             tasks = [
                 self.acquire_target_paper(),
-                self.image_forensics_investigation(),
                 self.data_integrity_investigation(),
                 self.methodology_audit(),
                 self.local_synthesize_findings(),
             ]
-            skip_roles = {
-                "Senior Plagiarism Detection Specialist",
-                "Citation Manipulation Investigator",
-                "Peer Review Integrity Inspector",
-                "Publication Productivity Anomaly Analyst",
-            }
             worker_agents = [
-                a for a in self.agents
-                if a.role != manager.role and a.role not in skip_roles
+                self.data_integrity_auditor(),
+                self.methodology_consistency_reviewer(),
+                self.evidence_synthesizer(),
             ]
             logger.info(
                 f"Local-only mode: {len(tasks)} tasks, "
                 f"{len(worker_agents)} worker agents "
-                f"(image forensics + data integrity + methodology audit)"
+                f"(raw data integrity + methodology audit; no image processing)"
             )
         else:
             # Full mode: all tasks except plagiarism (disabled)
@@ -807,11 +815,21 @@ class AcademicFraudDetectionCrew:
             )
             inputs["image_forensics_precheck_json"] = self._json_for_task(precheck)
 
-    def _inject_local_paper_payload(self, inputs: dict, pdf_path: str) -> None:
+    def _inject_local_paper_payload(
+        self, inputs: dict, pdf_path: str, extract_images: bool = False
+    ) -> None:
         """Preload local PDF deterministically and inject structured task context."""
-        logger.info("Preloading local PDF via LocalPaperLoaderTool: %s", pdf_path)
+        logger.info(
+            "Preloading local PDF via LocalPaperLoaderTool: %s (extract_images=%s)",
+            pdf_path,
+            extract_images,
+        )
         try:
-            raw_output = self._local_paper_loader._run(pdf_path)
+            raw_output = self._local_paper_loader._run(
+                pdf_path,
+                extract_images=extract_images,
+                extract_tables=True,
+            )
             payload = self._coerce_local_paper_payload(raw_output, pdf_path)
             inputs["local_paper_payload"] = payload
             inputs["local_paper_payload_json"] = self._json_for_task(payload)
@@ -825,10 +843,10 @@ class AcademicFraudDetectionCrew:
             )
             inputs["local_paper_text"] = payload.get("full_text") or ""
             logger.info(
-                "Local PDF preload complete: %s images, %s panels, %s chars text",
-                len(payload.get("images") or []),
-                len(payload.get("panels") or []),
+                "Local PDF preload complete: %s chars text, %s tables, images disabled=%s",
                 payload.get("full_text_length_chars", 0),
+                len(payload.get("tables") or []),
+                not extract_images,
             )
         except Exception as e:
             logger.warning("Local PDF preload failed: %s", e)
@@ -856,6 +874,44 @@ class AcademicFraudDetectionCrew:
             )
             inputs["local_paper_text"] = ""
 
+    def _inject_local_case_payload(self, inputs: dict, case_dir: str) -> None:
+        """Discover case folder, load PDF text/tables, parse XLSX, and precompute evidence."""
+        manifest = discover_case_folder(case_dir)
+        inputs["case_manifest"] = manifest
+        inputs["case_manifest_json"] = self._json_for_task(manifest)
+        if manifest.get("errors"):
+            raise ValueError("; ".join(str(e) for e in manifest["errors"]))
+
+        pdf_path = str(manifest["selected_pdf"])
+        raw_paths = [entry["path"] for entry in manifest.get("raw_data_files", [])]
+        inputs["case_dir"] = case_dir
+        inputs["case_pdf_path"] = pdf_path
+        inputs["raw_data_files_json"] = self._json_for_task(manifest.get("raw_data_files", []))
+
+        self._inject_local_paper_payload(inputs, pdf_path, extract_images=False)
+
+        raw_payload = load_raw_data_files(raw_paths)
+        inputs["raw_data_payload"] = raw_payload
+        inputs["raw_data_datasets_json"] = self._json_for_task(raw_payload.get("datasets", []))
+        inputs["raw_data_profile_json"] = self._json_for_task(raw_payload.get("profile", {}))
+
+        precheck = run_raw_data_precheck(raw_payload, inputs.get("local_paper_payload") or {})
+        inputs["raw_data_precheck"] = format_raw_data_precheck_for_agent(precheck)
+        inputs["raw_data_precheck_json"] = self._json_for_task(precheck)
+        inputs["deterministic_evidence_json"] = self._json_for_task(
+            precheck.get("deterministic_findings", [])
+        )
+        inputs["confidence_summary_json"] = self._json_for_task(
+            precheck.get("confidence_summary", {})
+        )
+        inputs["allowed_claims_json"] = self._json_for_task(precheck.get("allowed_claims", []))
+        logger.info(
+            "Local case preload complete: %s XLSX files, %s datasets, %s evidence items",
+            len(raw_paths),
+            raw_payload.get("profile", {}).get("dataset_count", 0),
+            precheck.get("confidence_summary", {}).get("evidence_count", 0),
+        )
+
     # ═══════════════════════════════════════════════════════════════════
     # Hooks
     # ═══════════════════════════════════════════════════════════════════
@@ -882,24 +938,34 @@ class AcademicFraudDetectionCrew:
                     f"Must provide: {', '.join(required)}."
                 )
 
-        valid_types = {"doi", "arxiv_id", "title", "url", "semantic_scholar_id", "local_pdf"}
+        valid_types = {
+            "doi",
+            "arxiv_id",
+            "title",
+            "url",
+            "semantic_scholar_id",
+            "local_pdf",
+            "local_case",
+        }
         if inputs["identifier_type"] not in valid_types:
             raise ValueError(
                 f"Invalid identifier_type '{inputs['identifier_type']}'. "
                 f"Must be one of: {', '.join(sorted(valid_types))}."
             )
 
-        # Validate local PDF file exists
+        # Validate local PDF / local case paths before expensive parsing.
         if inputs["identifier_type"] == "local_pdf":
             pdf_path = inputs["paper_identifier"]
             if not os.path.exists(pdf_path):
-                raise FileNotFoundError(
-                    f"Local PDF file not found: {pdf_path}"
-                )
+                raise FileNotFoundError(f"Local PDF file not found: {pdf_path}")
             if not pdf_path.lower().endswith(".pdf"):
-                raise ValueError(
-                    f"File must be a PDF: {pdf_path}"
-                )
+                raise ValueError(f"File must be a PDF: {pdf_path}")
+        if inputs["identifier_type"] == "local_case":
+            case_dir = inputs.get("case_dir") or inputs["paper_identifier"]
+            if not os.path.exists(case_dir):
+                raise FileNotFoundError(f"Local case directory not found: {case_dir}")
+            if not os.path.isdir(case_dir):
+                raise ValueError(f"local_case must be a directory: {case_dir}")
 
         # Inject auto-generated values needed by task templates
         inputs.setdefault("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -912,74 +978,32 @@ class AcademicFraudDetectionCrew:
         inputs.setdefault("local_paper_panels_json", "[]")
         inputs.setdefault("local_paper_stats_json", "{}")
         inputs.setdefault("local_paper_text", "")
-        inputs.setdefault("image_forensics_precheck", "未在当前模式下执行图像取证工具预检。")
+        inputs.setdefault("image_forensics_precheck", "当前模式不执行图像取证工具预检。")
         inputs.setdefault("image_forensics_precheck_json", "{}")
-        inputs.setdefault("cross_figure_precheck", "未在当前模式下执行 cross-figure 预比对。")
+        inputs.setdefault("cross_figure_precheck", "当前模式不执行图像或柱状图 cross-figure 预比对。")
         inputs.setdefault("cross_figure_precheck_json", "{}")
+        inputs.setdefault("case_manifest", {})
+        inputs.setdefault("case_manifest_json", "{}")
+        inputs.setdefault("case_dir", "")
+        inputs.setdefault("case_pdf_path", "")
+        inputs.setdefault("raw_data_payload", {})
+        inputs.setdefault("raw_data_files_json", "[]")
+        inputs.setdefault("raw_data_datasets_json", "[]")
+        inputs.setdefault("raw_data_profile_json", "{}")
+        inputs.setdefault("raw_data_precheck", "未在当前模式下执行 XLSX 原始数据预检。")
+        inputs.setdefault("raw_data_precheck_json", "{}")
+        inputs.setdefault("deterministic_evidence_json", "[]")
+        inputs.setdefault("confidence_summary_json", "{}")
+        inputs.setdefault("allowed_claims_json", "[]")
 
-        # ── Run cross-figure precheck for local PDF mode ───────────────
-        # This is a DETERMINISTIC code-level pipeline that guarantees
-        # bar chart extraction + cross-figure comparison ALWAYS runs
-        # before the LLM agents start, regardless of agent behavior.
+        # ── Local deterministic preload/precheck ───────────────────────
+        # 本地模式只做 PDF 文本/表格与 XLSX 原始数据预检，不执行图片、面板、OCR 或图像比对。
         if inputs["identifier_type"] == "local_pdf":
             pdf_path = inputs["paper_identifier"]
-            self._inject_local_paper_payload(inputs, pdf_path)
-            self._inject_image_forensics_precheck(inputs)
-            logger.info(f"Running cross-figure precheck on {pdf_path}...")
-            try:
-                from .utils.cross_figure_pipeline import (
-                    run_cross_figure_pipeline,
-                    format_precheck_for_agent,
-                )
-
-                local_payload = inputs.get("local_paper_payload") or {}
-                image_output_dir = None
-                preloaded_images = None
-                if isinstance(local_payload, dict):
-                    mineru_payload = local_payload.get("mineru") or {}
-                    image_output_dir = (
-                        local_payload.get("image_output_dir")
-                        or mineru_payload.get("cache_dir")
-                    )
-                    payload_images = local_payload.get("images")
-                    if payload_images or mineru_payload.get("used"):
-                        preloaded_images = payload_images or []
-
-                precheck_result = run_cross_figure_pipeline(
-                    pdf_path,
-                    images_dir=image_output_dir,
-                    images=preloaded_images,
-                )
-                formatted = format_precheck_for_agent(precheck_result)
-
-                # Inject both formatted text (for task context) and raw JSON
-                # (for programmatic reference by the agent)
-                inputs["cross_figure_precheck"] = formatted
-                inputs["cross_figure_precheck_json"] = json.dumps(
-                    precheck_result, ensure_ascii=False, default=str
-                )
-
-                n_datasets = len(precheck_result.get("datasets", []))
-                n_matches = len(precheck_result.get("matches", []))
-                has_critical = precheck_result.get("has_critical_match", False)
-
-                logger.info(
-                    f"Cross-figure precheck complete: {n_datasets} datasets, "
-                    f"{n_matches} matches, critical={has_critical}"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Cross-figure precheck failed (investigation will proceed "
-                    f"without precheck data): {e}"
-                )
-                inputs["cross_figure_precheck"] = (
-                    "⚠️ 系统预比对未能完成（技术错误）。"
-                    "请手动调用 bar_chart_extract_values 和 cross_figure_data_compare。\n"
-                    f"错误信息：{e}"
-                )
-                inputs["cross_figure_precheck_json"] = json.dumps(
-                    {"error": str(e), "datasets": [], "matches": []}
-                )
+            self._inject_local_paper_payload(inputs, pdf_path, extract_images=False)
+        elif inputs["identifier_type"] == "local_case":
+            case_dir = inputs.get("case_dir") or inputs["paper_identifier"]
+            self._inject_local_case_payload(inputs, case_dir)
 
         logger.info(
             f"Starting investigation of {inputs['paper_identifier']} "

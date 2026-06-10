@@ -10,6 +10,7 @@ Examples:
     python -m academic_fraud_detector.main "Attention Is All You Need" title
     python -m academic_fraud_detector.main https://arxiv.org/abs/2301.12345 url
     python -m academic_fraud_detector.main /path/to/paper.pdf local_pdf
+    python -m academic_fraud_detector.main --case /path/to/case_folder
 
 Output:
     Produces 3 files: .md (Markdown), .html (styled HTML), .pdf (PDF, if available)
@@ -20,6 +21,8 @@ Environment variables:
     OPENAI_API_KEY      — API key
     OPENAI_API_BASE     — Custom API base URL (DeepSeek, etc.)
 """
+
+# ruff: noqa: E402
 
 import sys
 import json
@@ -44,6 +47,7 @@ if sys.platform == "win32":
         pass
 
 from .crew import AcademicFraudDetectionCrew
+from .utils.case_folder import discover_case_folder
 
 # Configure logging
 logging.basicConfig(
@@ -309,7 +313,7 @@ def save_report_files(
     try:
         import webbrowser
         webbrowser.open(str(html_path))
-        logger.info(f"[HTML] 已在浏览器中打开报告。")
+        logger.info("[HTML] 已在浏览器中打开报告。")
     except Exception:
         pass
 
@@ -327,8 +331,8 @@ def run_investigation(
     Produces 3 report formats: .md (Markdown), .html (styled HTML), .pdf (PDF).
 
     Args:
-        paper_identifier: DOI, arXiv ID, title, URL, or local PDF path.
-        identifier_type: One of 'doi', 'arxiv_id', 'title', 'url', 'local_pdf'.
+        paper_identifier: DOI, arXiv ID, title, URL, local PDF path, or local case folder.
+        identifier_type: One of 'doi', 'arxiv_id', 'title', 'url', 'local_pdf', 'local_case'.
         output_dir: Directory for output files. Defaults to ./reports/
 
     Returns:
@@ -338,12 +342,14 @@ def run_investigation(
     start_time = datetime.now()
 
     # ── Kickoff the crew ──
-    is_local = (identifier_type == "local_pdf")
+    is_local = identifier_type in {"local_pdf", "local_case"}
     crew_instance = AcademicFraudDetectionCrew(local_only=is_local).crew()
     inputs = {
         "paper_identifier": paper_identifier,
         "identifier_type": identifier_type,
     }
+    if identifier_type == "local_case":
+        inputs["case_dir"] = paper_identifier
 
     try:
         result = crew_instance.kickoff(inputs=inputs)
@@ -380,7 +386,7 @@ def run_investigation(
     risk_score = _extract_risk_score_from_markdown(markdown_text)
 
     print("\n" + "=" * 70)
-    print(f"  学术诚信调查报告")
+    print("  学术诚信调查报告")
     print("=" * 70)
     print(f"  论文       : {title[:55]}")
     if risk_level:
@@ -421,23 +427,25 @@ def main():
     if len(sys.argv) < 2:
         print(__doc__)
         print("\n参数：")
-        print("  paper_identifier   — DOI, arXiv ID, 论文标题, URL, 或本地 PDF 路径")
-        print("  identifier_type    — doi, arxiv_id, title, url, local_pdf 之一 (默认: doi)")
+        print("  paper_identifier   — DOI, arXiv ID, 论文标题, URL, 本地 PDF 路径或案例目录")
+        print("  identifier_type    — doi, arxiv_id, title, url, local_pdf, local_case 之一 (默认: doi)")
         print("\n选项：")
-        print("  --pdf PATH         — 本地 PDF 快捷方式 (等同于 local_pdf)")
+        print("  --pdf PATH         — 本地 PDF 快捷方式 (等同于 local_pdf，不做图片分析)")
+        print("  --case DIR         — 本地案例目录（1个PDF + 若干XLSX原始数据）")
         print("  --output-dir DIR   — 输出目录 (默认: ./reports/)")
         print("  --quiet            — 静默模式")
         print("\n示例：")
         print("  python -m academic_fraud_detector.main 10.1038/nature12345 doi")
         print("  python -m academic_fraud_detector.main --pdf /path/to/paper.pdf")
-        print("  python -m academic_fraud_detector.main /path/to/paper.pdf local_pdf")
+        print("  python -m academic_fraud_detector.main --case /path/to/case_folder")
+        print("  python -m academic_fraud_detector.main /path/to/case_folder local_case")
         print("\n输出文件：")
         print("  .md   — 中文 Markdown 报告（主格式，可直接阅读）")
         print("  .html — 带样式的 HTML 报告（可在浏览器中打开并打印为 PDF）")
         print("  .pdf  — PDF 报告（需安装 weasyprint）")
         sys.exit(1)
 
-    # Handle --pdf shorthand: --pdf /path/to/paper.pdf
+    # Handle local shorthand flags.
     paper_id = sys.argv[1]
     id_type = "doi"  # default
 
@@ -448,6 +456,13 @@ def main():
             sys.exit(1)
         paper_id = sys.argv[2]
         id_type = "local_pdf"
+    elif paper_id == "--case":
+        if len(sys.argv) < 3:
+            print("[错误] --case 需要提供案例目录。")
+            print("   示例: python -m academic_fraud_detector.main --case /path/to/case_folder")
+            sys.exit(1)
+        paper_id = sys.argv[2]
+        id_type = "local_case"
     elif len(sys.argv) > 2 and not sys.argv[2].startswith("--"):
         id_type = sys.argv[2]
 
@@ -460,7 +475,7 @@ def main():
         if arg == "--quiet":
             quiet = True
 
-    # Early validation for local PDF files
+    # Early validation for local inputs
     if id_type == "local_pdf":
         if not os.path.exists(paper_id):
             print(f"[错误] 文件不存在: {paper_id}")
@@ -468,7 +483,17 @@ def main():
         if not paper_id.lower().endswith(".pdf"):
             print(f"[错误] 文件必须是 PDF 格式: {paper_id}")
             sys.exit(1)
-        print(f"[PDF] 正在加载本地 PDF: {paper_id}")
+        print(f"[PDF] 正在加载本地 PDF（不做图片分析）: {paper_id}")
+    elif id_type == "local_case":
+        manifest = discover_case_folder(paper_id)
+        if manifest.get("errors"):
+            print(f"[错误] 案例目录不可用: {paper_id}")
+            for error in manifest["errors"]:
+                print(f"  - {error}")
+            sys.exit(1)
+        print(f"[CASE] 正在加载本地案例目录: {paper_id}")
+        print(f"       PDF: {manifest.get('selected_pdf')}")
+        print(f"       XLSX: {len(manifest.get('raw_data_files', []))} 个")
 
     if quiet:
         logging.getLogger().setLevel(logging.WARNING)

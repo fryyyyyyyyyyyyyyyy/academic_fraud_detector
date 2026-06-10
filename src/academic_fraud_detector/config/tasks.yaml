@@ -28,27 +28,29 @@ acquire_target_paper:
 
     获取被调查论文的完整元数据和尽可能多的全文内容。
 
-    ### 如果 identifier_type 是 "local_pdf"：
-    论文为本地 PDF 文件。系统已在任务启动前确定性运行 `local_paper_loader`，
-    请首先使用以下预加载结果，不要重复调用工具，除非状态为 error 或 JSON 明显缺失关键字段。
+    ### 如果 identifier_type 是 "local_pdf" 或 "local_case"：
+    论文为本地 PDF 文件，或来自本地案例目录中的 PDF。系统已在任务启动前确定性运行
+    `local_paper_loader`，并且按当前需求关闭了图片提取。请首先使用以下预加载结果，
+    不要重复调用工具，除非状态为 error 或 JSON 明显缺失关键字段。
 
     - local_paper_load_status: {local_paper_load_status}
     - local_paper_load_error: {local_paper_load_error}
     - local_paper_summary: {local_paper_summary}
+    - case_manifest_json: {case_manifest_json}
 
-    预加载 JSON（必须保留其中的 full_text、images、panels、tables、pre_extracted_stats、mineru 字段）：
+    预加载 JSON（必须保留其中的 full_text、tables、pre_extracted_stats、mineru 字段）：
 
     {local_paper_payload_json}
 
     你的任务是将上述 JSON 整理为下方 expected_output 的结构化结果，并确保下游任务能看到：
     1. 全文 Markdown/文本（`full_text`）。
-    2. 所有本地图片路径（`images[*].filepath`，包括 MinerU 缓存图片和 PyMuPDF 图片）。
-    3. 所有独立面板路径（`panels`）。
-    4. 所有表格和预提取统计数据（`tables`、`pre_extracted_stats`）。
-    5. MinerU 解析状态和缓存路径（`mineru`）。
+    2. 所有表格和预提取统计数据（`tables`、`pre_extracted_stats`）。
+    3. MinerU 解析状态和缓存路径（`mineru`）。
+    4. local_case 的案例目录、选定 PDF 和 XLSX 原始数据文件清单。
+    **本地模式不做图片处理，不要要求图片路径、面板路径或图像取证结果。**
     **切勿调用外部 API 工具**（arxiv_search、crossref_search、semantic_scholar_search）。
 
-    ### 如果 identifier_type 不是 "local_pdf"：
+    ### 如果 identifier_type 不是 "local_pdf" 或 "local_case"：
     1. 使用 {paper_identifier} 和 {identifier_type} 识别论文。
     2. 通过 arXiv、CrossRef 和 Semantic Scholar 搜索获取完整元数据。
     3. 如 API 无法获取全文，尝试下载 PDF 并用 PyMuPDF 提取文本。
@@ -75,9 +77,9 @@ acquire_target_paper:
       "identifiers": { "arxiv": "...", "s2": "...", "doi": "..." },
       "full_text_available": true/false,
       "full_text": "全文内容" 或 null,
-      "figures": [{"number": 1, "caption": "图注", "url": "路径或URL"}],
-      "images": [{"filename": "...", "filepath": "本地图片路径", "source": "mineru|pymupdf", "width": ..., "height": ...}],
-      "panels": ["本地独立面板路径1", "本地独立面板路径2"],
+      "figures": [{"number": 1, "caption": "图注或图题", "url": "路径或URL（如有）"}],
+      "images": [],
+      "panels": [],
       "tables": [{"number": 1, "caption": "表注", "rows": [...], "columns": [...]}],
       "pre_extracted_stats": {"p_values": [...], "means_and_sds": [...], "numeric_values": [...]},
       "mineru": {"used": true/false, "cache_dir": "...", "full_md_path": "...", "image_count": ...},
@@ -334,135 +336,95 @@ image_forensics_investigation:
 
 data_integrity_investigation:
   description: >
-    ## 任务：统计数据完整性审计
+    ## 任务：XLSX 原始数据完整性审计
 
-    分析目标论文中报告的数值数据，寻找数据造假或操纵的统计痕迹。
+    分析目标论文 PDF 与本地 XLSX 原始数据，寻找数据造假或操纵的客观统计痕迹。
 
-    ### 🔴🔴 预比对结果（系统已确定性执行完毕！直接使用，不要重新调用工具！）🔴🔴
+    ### 🔴 确定性预检结果（系统已在启动前执行）
 
-    系统已在启动前**确定性地完成了以下所有步骤**：
-    1. ✅ 所有柱状图的数值提取（bar_chart_extract_values）
-    2. ✅ 跨图数据比对（cross_figure_data_compare）
-    3. ✅ PDF文本中所有数值的提取（均值、SD、p值、百分比等）
-    4. ✅ 本福特定律检验
-    5. ✅ p值分布分析（卡尺检验 + 均匀性检验）
-    6. ✅ GRIM检验
-    7. ✅ 异常精度检测（CV分析 + 末位数字偏好 + 近等差数列检测 + 高频重复值检测）
+    以下预检由代码层确定性执行，不依赖大模型主观判断。你不需要、也不应该重新调用
+    图像 OCR、柱状图提取或图像相似度工具；当前本地流程不做任何图片处理。
 
-    **这些检验已经全部执行完毕，结果在下方。你不需要、也不应该再调用任何工具
-    来重复这些检验。你的唯一任务是将这些结果忠实地转录到最终报告中。**
+    #### 案例材料清单
 
-    以下是完整的预计算结果：
+    {case_manifest_json}
 
-    {cross_figure_precheck}
-
-    预比对原始 JSON（用于核对 datasets、matches、统计预检字段）：
-
-    {cross_figure_precheck_json}
-
-    PDF 预加载提取的表格、统计值和解析状态如下（必须优先使用）：
+    #### PDF 文本/表格提取状态
 
     {local_paper_stats_json}
 
-    ### 🚨 关键评分规则（必须严格遵守）
+    #### XLSX 原始数据文件
 
-    **你已经收到了系统预计算的所有统计检验结果。评分必须反映这些实际结果：**
+    {raw_data_files_json}
 
-    | 预计算发现 | 数据完整性评分 |
-    |-----------|---------------|
-    | CRITICAL 跨图匹配（shared_group_exact_match/exact_match） | **90-100** |
-    | HIGH 跨图匹配（near_match） | **75-85** |
-    | 近等差数列检测标记（severity=critical/high） | **70-85** |
-    | 末位数字严重偏好（末位5或0占比>25%） | **+15到现有评分** |
-    | 高频重复值标记 | **+15到现有评分** |
-    | Benford MAD>0.015 或 p<0.05 | **60-80** |
-    | p值卡尺比率>2.0 | **60-75** |
-    | GRIM不一致（数学上不可能） | **85-100** |
-    | 仅CV异常（CV<1%） | **45-60** |
-    | 仅末位数字轻度偏好（15-20%） | **35-50** |
-    | **以上全部阴性 + 文本提取到足够数值** | **10-20** |
-    | **以上全部阴性 + 确实提取不到任何数值** | **5-15** |
+    #### XLSX 数据集概况
 
-    ### 🚨 禁止行为（违反即视为检测失败）
+    {raw_data_profile_json}
 
-    - ❌ **严禁写"因数据不足/数据格式不兼容，检验未执行"** — 检验已经由系统执行了！
-    - ❌ **严禁写"p值仅以阈值形式报告"来跳过分析** — 系统已从PDF文本和图表中
-      提取了所有可用数值，结果就在上面的预比对结果中。
-    - ❌ **严禁给出5分的评分除非确实所有检验（包括等差数列、末位数字、高频重复、
-      跨图比对）全部阴性**。
-    - ❌ **严禁忽略近等差数列检测的结果** — 如果预比对结果中标记了任何序列的
-      CV_diff<0.10，这是人为编造数据的最强信号，必须报告！
-    - ❌ **严禁忽略末位=5的高频出现** — 如果预比对结果中末位5占比>15%，
-      必须在报告中明确列出这个发现。
-    - ✅ **必须在报告的"数据完整性分析"部分逐项列出所有预计算的检验结果**，
-      包括那些结果为阴性的检验（写"检验执行完毕，未发现异常"，而非"未执行"）。
+    #### 原始数据确定性预检摘要
 
-    ### 数据可用性说明
+    {raw_data_precheck}
 
-    系统已从以下来源提取了数据：
-    - PDF文本层：通过正则表达式提取所有数值（均值、SD、p值、百分比、样本量）
-    - 柱状图图片：通过计算机视觉测量柱高度并插值计算实际数值
-    - 如果论文确实以 "*P<0.05" 形式报告显著性（这在生物医学论文中很常见），
-      则精确p值分布分析可能受限 — 但这**不代表数据完整性分析整体失败**，
-      因为系统还从图表和文本中提取了大量其他数值数据供其他检验使用。
+    #### 原始数据确定性预检完整 JSON
 
-    ### 目标论文
+    {raw_data_precheck_json}
+
+    #### 可报告结论白名单（allowed_claims）
+
+    {allowed_claims_json}
+
+    ### 🚨 防主观臆断规则（必须严格遵守）
+
+    - 只能报告 deterministic_evidence_json / raw_data_precheck_json 中已经存在的证据。
+    - 每条风险结论必须引用 evidence_id、文件名、sheet、range、检测方法和统计量。
+    - 禁止根据作者身份、论文题目、研究方向、措辞、直觉或视觉印象推断造假。
+    - 禁止写任何图像取证、图像 OCR、柱状图 OCR 或图片相似度发现。
+    - 如果没有 high/critical 证据，必须明确写“未发现高置信度确定性数据造假证据”。
+    - 如果 raw_data_files_json 为空，说明当前是 PDF-only 本地模式，不能声称完成 XLSX 原始数据审计。
+    - 统计异常不等于单独证明造假；必须列出可能的非造假解释和人工复核建议。
+
+    ### 必须覆盖的证据类型
+
+    若预检 JSON 中存在以下 evidence_type，必须逐条转录并解释：
+    - approximate_arithmetic_sequence：近似等差数列，说明 diff_cv、R²、order_mode。
+    - raw_numeric_similarity：重复/相似数据，说明同序、乱序、子集或线性变换类型。
+    - decimal_suffix_overrepresentation / decimal_suffix_reuse_across_datasets：小数后缀异常。
+    - last_digit_overrepresentation / last_digit_absence / last_digit_distribution_chisquare：
+      小数最后一位异常，必须写出 binomial/chi-square/occupancy 概率。
+    - reported_statistic_mismatch 或 paper_raw_data_alignment 相关内容：论文统计量与原始数据核验。
+
+    ### 目标案例
     {paper_identifier}
   expected_output: >
     JSON 格式报告（所有文本字段必须使用中文描述）：
 
     {
-      "category": "data_fabrication",
+      "category": "raw_data_fabrication",
       "severity": "无风险|低风险|中风险|高风险|严重风险",
       "confidence": "低|中|高",
-      "summary": "2-5句中文叙述性总结",
-      "data_availability_level": "A|B|C|D（参见评分规则中的数据可用性等级定义）",
-      "data_availability_note": "中文说明为什么定为该等级，以及哪些检验因此无法执行",
-      "numbers_extracted": {
-        "total_numeric_values": ..., "means_sds_extracted": ...,
-        "p_values_extracted": ..., "test_statistics_extracted": ...,
-        "mean_n_pairs_for_grim": ...
+      "summary": "2-5句中文总结，只基于确定性证据",
+      "raw_data_profile": {
+        "file_count": ..., "sheet_count": ..., "dataset_count": ..., "numeric_value_count": ...
       },
-      "benford_result": {
-        "sample_size": ..., "chi_squared": ..., "p_value": ...,
-        "mad": ..., "flagged": true/false, "interpretation": "中文解读"
-      },
-      "pvalue_analysis": {
-        "count": ..., "caliper_ratio": ..., "uniformity_p": ...,
-        "flagged": true/false, "interpretation": "中文解读"
-      },
-      "grim_results": {
-        "pairs_tested": ..., "inconsistent_count": ...,
-        "findings": ["不一致配对1: (均值, N) = ..."], "flagged": true/false
-      },
-      "anomalous_precision_result": {
-        "cv_analysis": { "pairs_tested": ..., "cv_critical_count": ..., "cv_warning_count": ..., "description": "中文描述" },
-        "digit_preference": { "digit_frequencies": {...}, "last_digit_5_freq": ..., "last_digit_0_freq": ..., "zero_five_pct": ..., "description": "中文描述，特别注意末位=5的占比" },
-        "near_arithmetic_progression": { "series_tested": ..., "flagged_series": ..., "details": [{"values": [...], "cv_of_diffs": ..., "r_squared": ..., "severity": "...", "interpretation": "中文"}], "description": "中文描述" },
-        "high_frequency_repeats": { "flagged_values": [...], "description": "中文描述" },
-        "significance_concentration": { "significant_pct": ..., "p_hacking_zone_pct": ..., "description": "中文描述" },
-        "flagged": true/false
-      },
-      "statistical_consistency_result": {
-        "total_tested": ..., "inconsistent_count": ...,
-        "findings": [{"test_type": "...", "reported_p": ..., "computed_p": ..., "discrepancy": "中文描述"}],
-        "flagged": true/false
-      },
-      "unexecuted_tests": [
+      "confidence_summary": { "overall_risk": "...", "confidence_score": ..., "evidence_count": ... },
+      "findings": [
         {
-          "test_name": "中文名称",
-          "reason": "无法执行的原因（如：论文未报告具体p值；论文未提供均值±SD；样本量不足等）",
-          "is_data_limitation": true,
-          "note": "这不是造假证据，仅表示数据格式不支持该检验"
+          "evidence_id": "E-0001",
+          "evidence_type": "...",
+          "severity": "...",
+          "confidence_score": ...,
+          "source_location": {"file_name": "...", "sheet": "...", "range": "..."},
+          "statistics": {"p_value": ..., "q_value": ..., "effect_size": "如有"},
+          "deterministic_basis": "中文解释",
+          "alternative_explanations": ["可能的非造假解释"],
+          "recommended_human_check": ["人工复核建议"]
         }
       ],
-      "other_anomalies": ["其他中文标注的异常"],
-      "findings": [
-        { "type": "...", "detail": "中文详细说明", "severity": "...", "confidence": "..." }
-      ],
+      "paper_raw_data_alignment_note": "论文统计量与 XLSX 原始数据对齐核验摘要",
+      "unreported_or_low_confidence_signals": ["中低置信度或仅供人工复核的信号"],
+      "limitations": ["本次不做图片处理", "末位均匀假设限制", "Excel显示精度限制"],
       "category_risk_score": 0-100,
-      "total_checks": ...,
-      "flagged_checks": ...
+      "basis_rule": "所有结论均来自 evidence_id；未列入 allowed_claims 的指控不得报告。"
     }
   agent: data_integrity_auditor
   context: [acquire_target_paper]
@@ -1105,372 +1067,171 @@ synthesize_findings:
 
 local_synthesize_findings:
   description: >
-    ## 任务：汇总调查结果并生成最终中文 Markdown 报告（本地 PDF 模式）
+    ## 任务：汇总调查结果并生成最终中文 Markdown 报告（本地材料数据模式）
 
-    将已完成的三项专业调查（图像取证 + 数据完整性审计 + 方法论审查）的结果整合为一份
-    结构清晰、可直接阅读的中文 Markdown 报告。
+    将 PDF 文本/表格解析、XLSX 原始数据确定性预检、数据完整性审计和方法论审查
+    整合为一份中文 Markdown 报告。当前本地模式不做任何图像取证、图像 OCR、
+    柱状图 OCR、面板拆分或图片相似度分析。
 
-    **重要**：这是本地 PDF 调查模式。执行了图像取证、数据完整性检查和方法论一致性审查。
-    引用网络分析和同行评审调查均未执行（需外部 API）。
-    切勿为缺失的类别编造发现 — 如实标注为"未调查"并说明原因。
+    ### 输入材料与预检结果
 
-    ### 本地 PDF 加载状态核查（必须执行）
+    - 案例清单：{case_manifest_json}
+    - PDF 加载状态：{local_paper_load_status}
+    - PDF 加载错误：{local_paper_load_error}
+    - PDF 摘要：{local_paper_summary}
+    - PDF 表格/统计提取：{local_paper_stats_json}
+    - XLSX 文件：{raw_data_files_json}
+    - XLSX 数据概况：{raw_data_profile_json}
+    - 原始数据预检摘要：{raw_data_precheck}
+    - 原始数据预检 JSON：{raw_data_precheck_json}
+    - 确定性证据 JSON：{deterministic_evidence_json}
+    - 置信度摘要：{confidence_summary_json}
+    - 可报告结论白名单：{allowed_claims_json}
 
-    - local_paper_load_status: {local_paper_load_status}
-    - local_paper_load_error: {local_paper_load_error}
-    - local_paper_summary: {local_paper_summary}
-    - images: {local_paper_images_json}
-    - panels: {local_paper_panels_json}
-    - image_forensics_precheck: {image_forensics_precheck}
-    - image_forensics_precheck_json: {image_forensics_precheck_json}
+    ### 🚨 汇总规则（必须严格遵守）
 
-    如果 local_paper_load_status 为 success，且 images/panels 非空，最终报告不得写“无法访问本地 PDF”或
-    “未获得图像路径”。如果图像取证预检 JSON 中存在 tools_attempted，最终报告不得写“图像取证工具未实际执行”或
-    “当前环境未提供可调用工具接口”；应按 status 区分 success/error/skipped，并引用预检 JSON 的工具输出。
+    1. 最终报告的每条数据造假风险都必须能追溯到 evidence_id。
+    2. 没有 evidence_id 的判断只能写入“局限性”或“需人工复核”，不能写成造假发现。
+    3. 严禁基于作者身份、论文主题、主观可疑程度、视觉印象或外部传闻得出结论。
+    4. 严禁生成图像取证章节；只能说明“本次按用户要求未做图片处理分析”。
+    5. 若没有 high/critical 证据，应明确写“未发现高置信度确定性数据造假证据”。
+    6. 若 raw_data_files_json 为空，应标注为 PDF-only 本地模式，不能声称完成 XLSX 原始数据审计。
+    7. 对末位数字异常必须写出概率模型和 p_value/q_value；对近似等差必须写出 diff_cv/R²；
+       对重复/相似必须写出匹配类型和具体文件/sheet/range。
 
-    ### 🚨 交叉验证步骤（必须在评分前执行）
-
-    在读入各 Agent 报告后，你必须对每项发现执行以下验证：
-
-    1. **图像取证发现验证**：
-       - 对于每项图像相关发现，检查是否附带了**具体工具名称**和**工具返回的客观数据**。
-       - ✅ 有效证据："cross_image_duplicate_check 返回 Figure1_panel0 与 Figure4A_panel0
-         匹配，Hamming distance=2, confidence=very_high"
-       - ❌ 无效证据："图1和图4看起来相似"、"经视觉比对发现"、"疑似同一图片" → 标记为
-         "证据不足，从报告中剔除"
-       - 必须同时核对 `image_forensics_precheck_json`：如果其中已有 tools_attempted，说明工具已在
-         代码层实际调用，最终报告应转录 success/error/skipped 状态和覆盖范围。
-       - 如果图像取证报告没有正确使用预检结果，你必须用 `image_forensics_precheck_json` 纠正它，
-         不得沿用“工具未执行/接口不可用”的错误说法。
-       - 只有在工具实际返回 flagged=false 且无 matches 时，才能说明“已执行工具未发现异常”；
-         如果工具 status=error 或 skipped，只能作为流程限制说明，不能当作阴性证据。
-
-    2. **数据完整性发现验证**：
-       - ⚠️ **系统已在代码层面确定性执行了所有统计检验**（Benford、p值分布、
-         GRIM、异常精度、末位数字、近等差数列、高频重复值、跨图数据比对）。
-       - 检查数据完整性报告是否完整转录了所有预计算结果。如果报告写了
-         "因数据不足未执行"但预比对结果中有实际数据 → **这是 Agent 的错误，
-         必须纠正**。
-       - 确认跨图数据比对结果（尤其是 CRITICAL 和 HIGH 匹配）已被纳入报告。
-       - 确认近等差数列检测结果已被纳入报告（不得省略）。
-       - 确认末位数字偏好分析（末位=5和末位=0的占比）已被纳入报告。
-
-    3. **方法论发现验证**：
-       - 检查 reagent_verification 和 method_internal_consistency 工具是否被实际调用。
-       - LLM 基于知识的推理必须标注为"基于LLM知识的判断，需人工验证"。
-
-    ### 输入
-    你将收到以下完整输出：
-    - 图像取证调查报告
-    - 数据完整性审计报告
-    - 方法论一致性审查报告
-
-    ### 方法
-    1. **提取关键发现**（从三个类别）：
-       - 通读图像取证、数据完整性和方法论审查报告。
-       - 找出最严重和置信度最高的发现。
-       - 提取精确证据：具体内容、位置、置信度、支撑数据。
-       - **执行交叉验证步骤**（见上方），剔除无工具支撑的发现。
-
-    2. **计算总体风险评分**（修正加权标准）：
-       - 图像取证：权重 30%（降权原因：AI 图像比对存在误报风险，工具阴性时如实评分）
-       - 数据完整性：权重 55%（升权原因：统计检验结果客观可验证，误报率低）
-       - 方法论一致性：权重 15%
-       - 每维度按严重程度评 0-100 分。
-       - 最终分数 = 加权总和。
-       - 风险等级映射：0-15→无风险，16-35→低风险，36-55→中风险，56-75→高风险，76-100→严重风险。
-
-       **关键评分原则 — 基于实际检测结果而非数据可用性**：
-       - 数据完整性评分直接反映预计算检验中标记的异常数量和严重程度。
-       - CRITICAL跨图匹配 → 90-100分；近等差数列标记 → 70-85分；
-         末位数字严重偏好 → +15；高频重复值 → +15；Benford异常 → 60-80分。
-       - **仅在确实所有检验（包括跨图比对、等差数列、末位数字、高频重复、
-         Benford、GRIM、p值分布）全部阴性时，才评低分（0-20）**。
-       - "无法执行检验"不再是评分理由——检验已由系统确定性执行。
-         如果 PDF 文本中确实完全没有数值数据，标注为"PDF文本无可提取数值"
-         而非"数据不足无法评估"。
-
-       **各维度评分参考**：
-       - 图像取证：工具检测到篡改证据→60-100；工具全部阴性→10-15；仅视觉判断无工具输出→10（无效证据）
-       - 数据完整性：检测到造假证据（GRIM不一致/跨图重复/近等差/统计不一致）→60-100；
-         仅透明度不足无法检验→20-40；未发现异常→0-15
-       - 方法论一致性：发现严重矛盾→50-80；仅文本错误→30-50；无问题→0-15
-
-    3. **未调查类别处理**（引用操纵、同行评审欺诈、产出异常）：
-       - 在报告中添加"未调查"小节，说明原因。
-       - 清晰标注需外部数据库/API 访问才能完成。
-
-    4. **撰写中文执行摘要**（3-5 条要点）：
-       - 仅聚焦实际调查的内容。
-       - 每条一句话，清晰有力。
-
-    5. **生成建议**：仅基于实际发现。
-
-    6. **记录局限性**：诚实说明哪些未做，哪些需人工复核。
-
-    ### 目标论文
+    ### 目标案例
     {paper_identifier}
   expected_output: >
-    一份完整的中文 Markdown 格式调查报告。必须严格按照以下模板输出 ——
-    这是一份面向中文母语读者的正式学术诚信调查报告，需要使用 Markdown
-    语法进行排版（标题、表格、列表、加粗、分隔线等）。
+    一份完整的中文 Markdown 格式调查报告。必须输出纯 Markdown 文本（不是 JSON，不是代码块），
+    从 `#` 标题开始，并严格按以下结构组织：
 
-    你必须输出纯 Markdown 文本（不是 JSON！不是代码块！），从 `#` 标题开始：
-
-    ```
     # 学术诚信调查报告
 
     **报告编号**：INV-{timestamp}
     **调查日期**：{当前日期}
-    **调查模式**：本地 PDF 分析（图像取证 + 数据完整性审计 + 方法论审查）
+    **调查模式**：本地材料分析（PDF 文本/表格 + 可选 XLSX 原始数据；不做图片处理）
     **调查系统**：Academic Fraud Detection System (CrewAI)
 
     ---
 
-    ## 被调查论文
+    ## 一、输入材料
 
-    | 属性 | 内容 |
+    | 类型 | 内容 |
     |------|------|
-    | **论文标题** | （从获取阶段提取） |
-    | **作者** | （列出所有作者） |
-    | **发表年份** | （年份） |
-    | **来源** | 用户上传 PDF |
+    | 论文 PDF | local_case 从 case_manifest_json 填写 selected_pdf；local_pdf 使用 paper_identifier |
+    | XLSX 原始数据文件数 | 从 raw_data_profile_json 填写；local_pdf 无 XLSX 时写 0 |
+    | Sheet 数量 | 从 raw_data_profile_json 填写 |
+    | 标准化数据集数量 | 从 raw_data_profile_json 填写 |
+    | 可分析数值数量 | 从 raw_data_profile_json 填写 |
+
+    > 本次按用户要求不执行图像处理、图像取证、图像 OCR 或柱状图 OCR。
 
     ---
 
-    ## 执行摘要
+    ## 二、执行摘要
 
-    1. （最重要的图像取证发现，一句话）
-    2. （最重要的数据完整性发现，一句话）
-    3. （总体评估结论，一句话）
-    4. （主要局限性说明，一句话）
+    1. 用一句话说明总体风险等级和置信度。
+    2. 列出最重要的 high/critical 数据证据；必须包含 evidence_id。
+    3. 如无 high/critical 证据，明确说明未发现高置信度确定性数据造假证据。
+    4. 用一句话说明主要局限性。
 
     ---
 
-    ## 总体风险评估
+    ## 三、总体风险评估
 
     | 指标 | 结果 |
     |------|------|
-    | **风险等级** | （无风险 / 低风险 / 中风险 / 高风险 / 严重风险） |
-    | **风险评分** | （0-100 分） |
-    | **置信度** | （高 / 中 / 低） |
+    | 风险等级 | 无风险 / 低风险 / 中风险 / 高风险 / 严重风险 |
+    | 风险评分 | 0-100 |
+    | 置信度 | 高 / 中 / 低 |
+    | 确定性证据数量 | critical/high/medium/low 分别多少 |
 
-    ### 评分方法
+    ### 评分依据
 
-    | 调查维度 | 权重 | 得分 | 说明 |
-    |----------|------|------|------|
-    | 图像取证 | 30% | （分数） | （一句话说明） |
-    | 数据完整性 | 55% | （分数） | （一句话说明） |
-    | 方法论一致性 | 15% | （分数） | （一句话说明） |
-    | 引用操纵 | — | 未调查 | 需引用数据库 API 访问 |
-    | 同行评审 | — | 未调查 | 需审稿元数据访问 |
-    | 产出异常 | — | 未调查 | 需外部文献数据库 API 访问 |
-
-    > **风险等级说明**：0-15 无风险 | 16-35 低风险 | 36-55 中风险 | 56-75 高风险 | 76-100 严重风险
+    - 分数只来自 confidence_summary_json 与带 evidence_id 的确定性证据。
+    - 数据完整性权重为 85%，方法论一致性权重为 15%。
+    - 图像取证、引用网络、同行评审和产出异常未调查，不参与评分。
 
     ---
 
-    ## 调查发现
+    ## 四、确定性数据证据
 
-    ### 一、图像取证分析
+    按严重程度从高到低列出所有 high/critical 证据；如数量较多，可先列 high/critical，
+    再汇总 medium/low。每条证据必须包含：
 
-    **严重程度**：（无 / 低 / 中 / 高 / 严重）
-    **置信度**：（高 / 中 / 低）
-    **分析图像总数**：（数字）
-    **标记图像数**：（数字）
+    ### 证据 E-XXXX：简短标题
 
-    #### 概述
-    （2-4 句话的叙述性总结）
-
-    #### 详细发现
-
-    **发现 1：（简短标题）**
-
-    - **图编号**：（如 Figure 3）
-    - **篡改类型**：（复制粘贴 / 拼接 / 擦除 / 翻转复用 / AI 生成 / 元数据异常）
-    - **检测工具**：（ELA / 克隆检测 / AI 检测 / 跨图重复检测 / 背景一致性检测）
-    - **置信度**：（高 / 中 / 低）
-    - **详细说明**：（描述具体检测到了什么，在图片的什么位置，有什么特征）
-    - **ELA 结果**：（如有，描述误差水平异常区域）
-    - **克隆检测结果**：（如有，描述发现几个克隆区域及坐标）
-    - **AI 检测结果**：（如有，描述噪声模式和频域分析结果）
-
-    **发现 2：...**
-    （继续列出所有标记的图像发现）
-
-    #### 跨图重复比对结果
-
-    - **重复配对**：（列出所有匹配的图对，如 "图 1 ↔ 图 4（汉明距离=3，旋转90°）"）
-    - **翻转拷贝**：（如有，列出翻转后匹配的图对）
-    - **总结**：（如无跨图重复，则写"未发现跨图重复使用"）
+    - **证据类型**：approximate_arithmetic_sequence / raw_numeric_similarity / decimal_suffix... / last_digit...
+    - **位置**：文件名、sheet、range
+    - **严重程度**：critical/high/medium/low
+    - **置信度**：confidence_score
+    - **统计依据**：列出 diff_cv、R²、p_value、q_value、χ²、匹配类型等实际字段
+    - **确定性依据**：转述 deterministic_basis
+    - **为什么可疑**：解释统计模式为什么不符合独立实验数据预期
+    - **可能的非造假解释**：列出 alternative_explanations
+    - **人工复核建议**：列出 recommended_human_check
 
     ---
 
-    ### 二、数据完整性分析
+    ## 五、专项分析
 
-    **严重程度**：（无 / 低 / 中 / 高 / 严重）
-    **置信度**：（高 / 中 / 低）
-    **提取数值总数**：（数字）
+    ### 5.1 近似等差数列
+    列出 approximate_arithmetic_sequence 证据；必须写 diff_cv、R²、order_mode。
 
-    #### 概述
-    （2-4 句话的叙述性总结）
+    ### 5.2 重复或相似数据
+    列出 raw_numeric_similarity 证据；必须写 same_order_exact、permutation_exact、
+    permutation_near、subset 或 linear_transform 等 match_type。
 
-    #### 🔴 跨图数据比对结果（强制执行，不可为空）
+    ### 5.3 小数部分/小数后缀异常
+    列出 decimal_suffix_overrepresentation 和 decimal_suffix_reuse_across_datasets 证据；
+    必须说明 suffix_length、shared_suffix_count 或 p_value。
 
-    | 比对配对 | 匹配类型 | 共享组/值 | 置信度 | 判定 |
-    |----------|----------|-----------|--------|------|
-    | （如 Fig 1E vs Fig 4B） | （如 共享组精确匹配） | （如 Control, COH, COH+RTA408） | （如 critical） | （🔴 数据造假铁证 / ✅ 无重复） |
+    ### 5.4 小数最后一位频率异常
+    列出 last_digit_overrepresentation、last_digit_absence、last_digit_distribution_chisquare 证据；
+    必须说明 binomial 或 chi-square 概率。对“某数字缺失”同时说明指定数字缺失概率和任一数字缺失概率。
 
-    > **如果此表只有这一行模板文字（没有实际数据），说明跨图数据比对未执行
-    > — 这是检测流程的严重缺陷，必须在局限性声明中明确记录。**
-    >
-    > **如果预比对发现了 critical 匹配，必须在此表中逐条列出，不得省略。**
+    ### 5.5 论文内容与原始数据对齐
+    基于 paper_raw_data_alignment 写摘要；如果没有明确映射，说明不能把未匹配直接当作造假证据。
 
-    #### 本福特定律检验
+    ---
 
-    | 指标 | 数值 | 判定 |
+    ## 六、方法论一致性审查
+
+    汇总 methodology_audit 的发现。LLM 知识性判断必须标注“需人工验证”。
+
+    ---
+
+    ## 七、未调查维度
+
+    | 维度 | 状态 | 原因 |
     |------|------|------|
-    | 样本量 | （数字） | — |
-    | 卡方统计量 | （数值） | — |
-    | p 值 | （数值） | （正常 / 异常） |
-    | 平均绝对离差 (MAD) | （数值） | （正常 / 异常） |
-    | **结论** | — | **（通过 / 未通过）** |
-
-    > （一句话解读本福特检验结果）
-
-    #### p 值分布分析
-
-    | 指标 | 数值 | 判定 |
-    |------|------|------|
-    | p 值总数 | （数字） | — |
-    | 卡尺比率 (0.045-0.05 vs 0.05-0.055) | （数值） | （正常 / 异常） |
-    | 均匀性检验 p 值 | （数值） | （正常 / 异常） |
-    | **结论** | — | **（通过 / 未通过）** |
-
-    > （一句话解读 p 值分布）
-
-    #### GRIM 检验
-
-    | 指标 | 数值 |
-    |------|------|
-    | 检验的 (均值, N) 配对 | （数字） |
-    | 不一致数量 | （数字） |
-    | **结论** | **（通过 / 未通过 — 如有不一致，标记为严重）** |
-
-    （如发现不一致，逐条列出具体的不一致配对及其含义）
-
-    #### 异常精度检测
-
-    **变异系数 (CV) 分析**：
-    - 检测的均值/SD 对数量：（数字）
-    - CV < 1% 的数量（严重）：（数字）
-    - CV < 3% 的数量（警告）：（数字）
-    - 结论：（数据变异是否在自然范围内）
-
-    **末位数字偏好分析**：
-    - 各末位数字频率分布：（列出 0-9 的频率）
-    - 偏好数字：（如有频率 >20%，列出）
-    - 0 和 5 合计占比：（百分比）
-    - 结论：（是否存在人为造数的末位偏好迹象）
-
-    **显著性浓度分析**：
-    - 显著的 p 值比例：（百分比）
-    - 恰在 [0.01, 0.05) 区间的比例：（百分比）
-    - 结论：（是否存在 p-hacking 迹象）
-
-    #### 统计一致性验证
-
-    | 指标 | 数值 |
-    |------|------|
-    | 检验的统计量数量 | （数字） |
-    | 不一致数量 | （数字） |
-    | **结论** | **（通过 / 未通过）** |
-
-    （如发现不一致，逐条列出：报告值 vs 实际计算值 vs 偏差倍数）
+    | 图像取证 | 未调查 | 用户要求当前不做图片处理分析 |
+    | 引用网络分析 | 未调查 | 需 Semantic Scholar 等外部引用数据库 API |
+    | 同行评审审查 | 未调查 | 需公开审稿元数据 |
+    | 产出异常分析 | 未调查 | 需外部文献数据库 API |
 
     ---
 
-    ### 三、方法论一致性审查
+    ## 八、局限性与人工复核建议
 
-    **严重程度**：（无 / 低 / 中 / 高 / 严重）
-    **置信度**：（高 / 中 / 低）
-
-    #### 概述
-    （2-4 句话的叙述性总结）
-
-    #### 试剂/设备校验
-    （列出校验结果：试剂型号是否存在、Cat# 格式是否正确、是否有编造的试剂编号）
-
-    #### 伦理审批号校验
-    （列出伦理审批号格式校验结果）
-
-    #### 实验时间线
-    （实验周期 vs 投稿日期是否存在时间冲突）
-
-    #### Methods 内部自洽性
-    （n 值声明一致性、组数一致性等）
+    - 小数末位检验依赖“连续测量值末位近似均匀”的假设。
+    - Excel 存储值与显示格式可能不完全一致。
+    - 如果数据列是剂量、时间点、编号或标准曲线，近似等差可能是实验设计造成。
+    - 自动检测结果应由领域专家结合实验设计和原始记录复核。
 
     ---
 
-    ## 未调查维度
+    ## 九、证据清单
 
-    | 维度 | 原因 |
-    |------|------|
-    | **引用网络分析** | 需要 Semantic Scholar 等引用数据库 API 访问 |
-    | **同行评审审查** | 需要公开的审稿意见元数据（多数期刊不公开） |
-    | **产出异常分析** | 需要外部文献数据库（PubMed/CrossRef）API 访问 |
-
-    > 完整的七维度调查需要接入外部学术数据库 API。当前本地模式覆盖
-    > 图像取证、数据完整性审计和方法论一致性审查三个可直接从 PDF 分析的核心维度。
+    | Evidence ID | 类型 | 位置 | 严重程度 | 置信度 | 关键统计量 |
+    |-------------|------|------|----------|--------|------------|
+    | E-0001 | ... | ... | ... | ... | ... |
 
     ---
 
-    ## 跨维度关联分析
-
-    （如无特别关联，写"未发现图像取证与数据完整性之间的直接关联。"
-    如有关联，例如"同一作者的数据既被图像工具标记，也在统计检验中异常，
-    提示可能存在系统性造假。"）
-
-    ---
-
-    ## 建议
-
-    1. **（优先级 1）**（具体行动建议）— 紧急性：（立即 / 常规 / 建议性）
-       - 理由：（引用具体证据）
-    2. **（优先级 2）**...
-    3. ...
-
-    （如无重大发现，写"当前调查未发现需要立即行动的严重学术不端证据。"）
-
-    ---
-
-    ## 局限性声明
-
-    1. 引用网络分析未执行 — 需要外部 API 访问权限。
-    2. 同行评审调查未执行 — 需要公开的审稿元数据。
-    3. 产出异常分析未执行 — 需要外部文献数据库 API 访问。
-    4. 本次调查覆盖图像取证、数据完整性分析和方法论一致性审查三个维度。
-    5. 所有自动检测结果均需人工专家复核确认后方可作为正式证据。
-    6. （其他具体局限性，如 PDF 图片质量、表格提取失败等）
-
-    ---
-
-    ## 证据清单
-
-    | 编号 | 发现 | 位置 | 类别 | 置信度 |
-    |------|------|------|------|--------|
-    | EVID-001 | （具体发现） | （论文中位置） | （图像/数据） | （高/中/低） |
-    | EVID-002 | ... | ... | ... | ... |
-
-    ---
-
-    *本报告由 Academic Fraud Detection System (CrewAI) 自动生成。*
-    *检测结果仅供参考，不作为最终学术不端判定依据。*
-    *建议由相关领域专家进行人工复核。*
-    ```
+    *本报告由 Academic Fraud Detection System (CrewAI) 自动生成。检测结果仅供学术诚信初筛参考，不能替代正式调查结论。*
   agent: evidence_synthesizer
   context:
     - acquire_target_paper
-    - image_forensics_investigation
     - data_integrity_investigation
     - methodology_audit
