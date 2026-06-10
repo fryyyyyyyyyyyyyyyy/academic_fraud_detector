@@ -22,11 +22,13 @@ Algorithm:
 
 import logging
 import os
-from io import BytesIO
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
 
-from PIL import Image, ImageDraw
+from PIL import Image
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +250,6 @@ def _contour_fallback(
     This handles irregular layouts and non-grid arrangements.
     """
     import numpy as np
-    from PIL import ImageFilter
 
     h, w = arr.shape
 
@@ -322,9 +323,6 @@ def _contour_fallback(
 
 def threshold_for_region(proj_slice: "np.ndarray", total_dim: int) -> float:
     """Determine a sensible threshold for whether a projection slice contains real content."""
-    import numpy as np
-    max_val = float(np.max(proj_slice))
-    mean_val = float(np.mean(proj_slice))
     # If max projection is less than 1% of the dimension, it's a gap
     return max(total_dim * 0.005, 3.0)
 
@@ -404,64 +402,43 @@ def detect_panel_grid(
     }
 
 
-def extract_all_panels_from_pdf(
-    pdf_path: str,
-    output_dir: Optional[str] = None,
+def _split_images_to_panels(
+    images: List[Dict[str, Any]],
+    output_dir: str | Path,
     min_panel_size: int = DEFAULT_MIN_PANEL_SIZE,
-    min_image_size: int = 80,
     gap_fraction: float = DEFAULT_GAP_FRACTION,
-    max_pages: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Complete pipeline: extract embedded images from a PDF, then split each
-    composite figure into individual panels.
-
-    Args:
-        pdf_path: Path to the local PDF file.
-        output_dir: Directory to save extracted panel images.
-        min_panel_size: Minimum panel dimension in pixels.
-        min_image_size: Minimum image dimension to keep from PDF extraction.
-        gap_fraction: Gap detection sensitivity.
-        max_pages: Maximum PDF pages to process.
-
-    Returns:
-        List of panel metadata dicts. Each dict includes:
-        - All fields from extract_pdf_images (source page, etc.)
-        - 'panels': list of sub-panel dicts
-        - 'is_composite': True if figure was split into multiple panels
-    """
-    from ..utils.text_extraction import extract_pdf_images_from_file
-
-    # Extract images from PDF
-    images = extract_pdf_images_from_file(
-        pdf_path,
-        output_dir=output_dir,
-        min_size=min_image_size,
-        max_pages=max_pages,
-    )
-
-    if output_dir is None:
-        from ..utils.text_extraction import DEFAULT_IMAGE_OUTPUT_DIR
-        output_dir = DEFAULT_IMAGE_OUTPUT_DIR
-    else:
-        output_dir = Path(output_dir)
-
+    """Split already-extracted figure images into panels without extracting from PDF."""
     output_dir = Path(output_dir)
     panels_dir = output_dir / "panels"
     panels_dir.mkdir(parents=True, exist_ok=True)
 
     all_panels = []
 
-    for img_meta in images:
-        img_path = img_meta["filepath"]
+    for image_idx, img_meta in enumerate(images):
+        img_path = img_meta.get("filepath")
+        if not img_path:
+            all_panels.append({
+                **img_meta,
+                "panels": [],
+                "is_composite": False,
+                "panel_count": 0,
+                "grid": "1×1",
+                "error": "Image metadata missing filepath.",
+            })
+            continue
+
         try:
-            img = Image.open(img_path)
+            with Image.open(img_path) as opened:
+                img = opened.copy()
         except Exception as e:
             logger.warning(f"Could not open image for panel splitting: {img_path} — {e}")
             all_panels.append({
                 **img_meta,
                 "panels": [],
                 "is_composite": False,
+                "panel_count": 0,
+                "grid": "1×1",
                 "error": str(e),
             })
             continue
@@ -480,10 +457,16 @@ def extract_all_panels_from_pdf(
 
         # Save panel images
         saved_panels = []
-        base_name = os.path.splitext(img_meta["filename"])[0]
+        base_filename = img_meta.get("filename") or Path(str(img_path)).name or f"image_{image_idx + 1}"
+        base_name = Path(str(base_filename)).stem or f"image_{image_idx + 1}"
         for p in panels:
             panel_filename = f"{base_name}_panel_{p['panel_index']}.png"
             panel_path = panels_dir / panel_filename
+            counter = 1
+            while panel_path.exists():
+                panel_filename = f"{base_name}_panel_{p['panel_index']}_{counter}.png"
+                panel_path = panels_dir / panel_filename
+                counter += 1
 
             # Save panel image
             p["panel_image"].save(panel_path, format="PNG")
@@ -496,6 +479,10 @@ def extract_all_panels_from_pdf(
                 "height": p["height"],
                 "filepath": str(panel_path.absolute()),
                 "filename": panel_filename,
+                "pdf_page": img_meta.get("pdf_page") or img_meta.get("page_number"),
+                "page_number": img_meta.get("page_number") or img_meta.get("pdf_page"),
+                "source": img_meta.get("source"),
+                "source_image_filename": img_meta.get("filename"),
             })
 
         is_composite = len(panels) > 1
@@ -509,14 +496,89 @@ def extract_all_panels_from_pdf(
             if panels else "1×1",
         })
 
-    total_panels = sum(entry["panel_count"] for entry in all_panels)
-    composite_count = sum(1 for entry in all_panels if entry["is_composite"])
+    total_panels = sum(entry.get("panel_count", 0) for entry in all_panels)
+    composite_count = sum(1 for entry in all_panels if entry.get("is_composite"))
     logger.info(
         f"Panel extraction complete: {len(images)} figures → {total_panels} panels "
         f"({composite_count} composite figures split)"
     )
 
     return all_panels
+
+
+def extract_all_panels_from_images(
+    images: List[Dict[str, Any]],
+    output_dir: Optional[str] = None,
+    min_panel_size: int = DEFAULT_MIN_PANEL_SIZE,
+    gap_fraction: float = DEFAULT_GAP_FRACTION,
+) -> List[Dict[str, Any]]:
+    """
+    Split already-extracted figure images into panels.
+
+    This reuses MinerU/PyMuPDF image metadata and never extracts images from the
+    source PDF, preventing historical extracted_images content from being mixed in.
+    """
+    if output_dir is None:
+        from ..utils.text_extraction import create_unique_image_output_dir
+        source_name = None
+        if images:
+            source_name = images[0].get("filename") or images[0].get("filepath")
+        output_dir = create_unique_image_output_dir(prefix="image_panels", source_name=source_name)
+
+    return _split_images_to_panels(
+        images,
+        output_dir=output_dir,
+        min_panel_size=min_panel_size,
+        gap_fraction=gap_fraction,
+    )
+
+
+def extract_all_panels_from_pdf(
+    pdf_path: str,
+    output_dir: Optional[str] = None,
+    min_panel_size: int = DEFAULT_MIN_PANEL_SIZE,
+    min_image_size: int = 80,
+    gap_fraction: float = DEFAULT_GAP_FRACTION,
+    max_pages: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Complete pipeline: extract embedded images from a PDF, then split each
+    composite figure into individual panels.
+
+    Args:
+        pdf_path: Path to the local PDF file.
+        output_dir: Directory to save extracted images and panel images. If None,
+            creates a unique cache directory for this extraction.
+        min_panel_size: Minimum panel dimension in pixels.
+        min_image_size: Minimum image dimension to keep from PDF extraction.
+        gap_fraction: Gap detection sensitivity.
+        max_pages: Maximum PDF pages to process.
+
+    Returns:
+        List of panel metadata dicts. Each dict includes:
+        - All fields from extract_pdf_images (source page, etc.)
+        - 'panels': list of sub-panel dicts
+        - 'is_composite': True if figure was split into multiple panels
+    """
+    from ..utils.text_extraction import create_unique_image_output_dir, extract_pdf_images_from_file
+
+    if output_dir is None:
+        output_dir = create_unique_image_output_dir(prefix="pdf_panels", source_name=Path(pdf_path).name)
+
+    # Extract images from PDF into this extraction's isolated directory.
+    images = extract_pdf_images_from_file(
+        pdf_path,
+        output_dir=str(output_dir),
+        min_size=min_image_size,
+        max_pages=max_pages,
+    )
+
+    return _split_images_to_panels(
+        images,
+        output_dir=output_dir,
+        min_panel_size=min_panel_size,
+        gap_fraction=gap_fraction,
+    )
 
 
 def save_panels_for_tools(

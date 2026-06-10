@@ -21,11 +21,13 @@ Usage:
     })
 """
 
+# ruff: noqa: E402
+
 import json
 import os
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -494,6 +496,367 @@ class AcademicFraudDetectionCrew:
         )
 
     # ═══════════════════════════════════════════════════════════════════
+    # Local PDF preloading helpers
+    # ═══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _json_for_task(value: Any) -> str:
+        """Serialize injected task context consistently for YAML templates."""
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _coerce_local_paper_payload(raw_output: Any, pdf_path: str) -> dict[str, Any]:
+        """Normalize LocalPaperLoaderTool output into a dict payload."""
+        if isinstance(raw_output, dict):
+            return raw_output
+
+        if isinstance(raw_output, str):
+            try:
+                payload = json.loads(raw_output)
+                if isinstance(payload, dict):
+                    return payload
+                return {
+                    "source": "local_pdf",
+                    "file_path": pdf_path,
+                    "raw_output": payload,
+                    "warning": "LocalPaperLoaderTool returned JSON that was not an object.",
+                }
+            except json.JSONDecodeError:
+                return {
+                    "source": "local_pdf",
+                    "file_path": pdf_path,
+                    "raw_output": raw_output,
+                    "warning": "LocalPaperLoaderTool returned a non-JSON string.",
+                }
+
+        return {
+            "source": "local_pdf",
+            "file_path": pdf_path,
+            "raw_output": str(raw_output),
+            "warning": (
+                "LocalPaperLoaderTool returned unexpected type: "
+                f"{type(raw_output).__name__}"
+            ),
+        }
+
+    @staticmethod
+    def _local_paper_stats_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        """Build a compact statistics/extraction payload for data-audit tasks."""
+        return {
+            "pre_extracted_stats": payload.get("pre_extracted_stats", {}),
+            "tables": payload.get("tables", []),
+            "mineru": payload.get("mineru", {}),
+            "page_count": payload.get("page_count", 0),
+            "full_text_available": payload.get("full_text_available", False),
+            "full_text_length_chars": payload.get("full_text_length_chars", 0),
+            "image_count": len(payload.get("images") or []),
+            "panel_count": len(payload.get("panels") or []),
+            "table_count": len(payload.get("tables") or []),
+            "error": payload.get("error"),
+        }
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        """Read a non-negative integer environment variable with a safe default."""
+        raw = os.getenv(name)
+        if raw is None or raw.strip() == "":
+            return default
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid integer value for %s=%r", name, raw)
+            return default
+
+    @staticmethod
+    def _existing_paths_from_entries(entries: Any) -> list[str]:
+        """Extract unique existing local file paths from image/panel payload entries."""
+        paths: list[str] = []
+        seen = set()
+        for entry in entries or []:
+            if isinstance(entry, dict):
+                raw_path = (
+                    entry.get("filepath")
+                    or entry.get("path")
+                    or entry.get("image_path")
+                    or entry.get("filename")
+                )
+            else:
+                raw_path = entry
+
+            if not raw_path:
+                continue
+            path = str(raw_path)
+            if path in seen or not os.path.exists(path):
+                continue
+            seen.add(path)
+            paths.append(path)
+        return paths
+
+    @staticmethod
+    def _take_with_limit(paths: list[str], limit: int) -> tuple[list[str], int]:
+        """Return paths selected for precheck and the number omitted by the cap."""
+        if limit <= 0:
+            return [], len(paths)
+        selected = paths[:limit]
+        return selected, max(0, len(paths) - len(selected))
+
+    @staticmethod
+    def _parse_tool_json_output(raw_output: Any) -> dict[str, Any]:
+        """Normalize a forensic tool output into a JSON-compatible dictionary."""
+        if isinstance(raw_output, dict):
+            return raw_output
+        if isinstance(raw_output, str):
+            try:
+                parsed = json.loads(raw_output)
+                if isinstance(parsed, dict):
+                    return parsed
+                return {"raw_output": parsed, "flagged": False}
+            except json.JSONDecodeError:
+                return {
+                    "error": "Tool returned a non-JSON string.",
+                    "raw_output": raw_output,
+                    "flagged": False,
+                }
+        return {"raw_output": str(raw_output), "flagged": False}
+
+    def _run_forensics_tool(self, tool: Any, **kwargs: Any) -> dict[str, Any]:
+        """Run one image forensics tool and capture status plus parsed output."""
+        tool_name = getattr(tool, "name", tool.__class__.__name__)
+        try:
+            output = self._parse_tool_json_output(tool._run(**kwargs))
+            matches = output.get("matches")
+            if isinstance(matches, list) and len(matches) > 50:
+                output = dict(output)
+                output.setdefault("match_count", len(matches))
+                output["matches"] = matches[:50]
+                output["matches_truncated"] = len(matches) - 50
+            status = "error" if output.get("error") else "success"
+            return {"tool": tool_name, "status": status, "output": output}
+        except Exception as e:
+            logger.warning("Image forensics tool %s failed: %s", tool_name, e)
+            return {
+                "tool": tool_name,
+                "status": "error",
+                "output": {"error": str(e), "flagged": False},
+            }
+
+    @staticmethod
+    def _record_flagged(record: dict[str, Any]) -> bool:
+        """Return whether a captured tool record contains a positive finding."""
+        return bool(record.get("output", {}).get("flagged"))
+
+    def _run_image_forensics_precheck(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Run deterministic image forensics tools on preloaded local PDF images."""
+        image_paths = self._existing_paths_from_entries(payload.get("images", []))
+        panel_paths = self._existing_paths_from_entries(payload.get("panels", []))
+
+        max_single_images = self._env_int("IMAGE_FORENSICS_MAX_SINGLE_IMAGES", 12)
+        max_cross_images = self._env_int("IMAGE_FORENSICS_MAX_CROSS_IMAGES", 200)
+        max_feature_panels = self._env_int("IMAGE_FORENSICS_MAX_FEATURE_PANELS", 80)
+
+        single_paths, single_omitted = self._take_with_limit(image_paths, max_single_images)
+        cross_paths, cross_omitted = self._take_with_limit(image_paths, max_cross_images)
+        feature_paths, feature_omitted = self._take_with_limit(panel_paths, max_feature_panels)
+
+        result: dict[str, Any] = {
+            "status": "success" if image_paths or panel_paths else "no_input",
+            "input_counts": {
+                "images_total": len(payload.get("images") or []),
+                "images_existing": len(image_paths),
+                "panels_total": len(payload.get("panels") or []),
+                "panels_existing": len(panel_paths),
+            },
+            "limits": {
+                "max_single_images": max_single_images,
+                "max_cross_images": max_cross_images,
+                "max_feature_panels": max_feature_panels,
+            },
+            "coverage": {
+                "single_image_tools_analyzed": len(single_paths),
+                "single_image_tools_omitted": single_omitted,
+                "cross_image_paths_analyzed": len(cross_paths),
+                "cross_image_paths_omitted": cross_omitted,
+                "feature_panel_paths_analyzed": len(feature_paths),
+                "feature_panel_paths_omitted": feature_omitted,
+            },
+            "per_image_results": [],
+            "cross_image_duplicate": {
+                "tool": getattr(self._cross_image_duplicate, "name", "cross_image_duplicate_check"),
+                "status": "skipped",
+                "reason": "Need at least 2 existing image paths.",
+            },
+            "feature_based_duplicate": {
+                "tool": getattr(self._feature_duplicate, "name", "feature_based_duplicate_check"),
+                "status": "skipped",
+                "reason": "Need at least 2 existing panel paths.",
+            },
+            "tools_attempted": [],
+            "flagged_tools": [],
+        }
+
+        if not image_paths and not panel_paths:
+            result["message"] = "No existing image or panel paths were available for forensic tools."
+            return result
+
+        for path in single_paths:
+            per_image = {"image_path": path, "tools": {}}
+            per_image["tools"]["error_level_analysis"] = self._run_forensics_tool(
+                self._ela, image_path_or_url=path
+            )
+            per_image["tools"]["clone_detection"] = self._run_forensics_tool(
+                self._clone_detection, image_path_or_url=path
+            )
+            per_image["tools"]["ai_image_detection"] = self._run_forensics_tool(
+                self._ai_image, image_path_or_url=path
+            )
+            per_image["tools"]["background_consistency_check"] = self._run_forensics_tool(
+                self._background_consistency, image_path_or_url=path
+            )
+            result["per_image_results"].append(per_image)
+
+        if len(cross_paths) >= 2:
+            result["cross_image_duplicate"] = self._run_forensics_tool(
+                self._cross_image_duplicate,
+                image_paths=json.dumps(cross_paths, ensure_ascii=False),
+            )
+
+        if len(feature_paths) >= 2:
+            result["feature_based_duplicate"] = self._run_forensics_tool(
+                self._feature_duplicate,
+                image_paths=json.dumps(feature_paths, ensure_ascii=False),
+                min_inliers=8,
+                ratio_threshold=0.80,
+                sift_contrast_threshold=0.02,
+            )
+
+        attempted: list[str] = []
+        flagged: list[str] = []
+        for per_image in result["per_image_results"]:
+            for record in per_image["tools"].values():
+                attempted.append(record["tool"])
+                if self._record_flagged(record):
+                    flagged.append(record["tool"])
+        for key in ("cross_image_duplicate", "feature_based_duplicate"):
+            record = result[key]
+            if record.get("status") != "skipped":
+                attempted.append(record["tool"])
+                if self._record_flagged(record):
+                    flagged.append(record["tool"])
+
+        result["tools_attempted"] = sorted(set(attempted))
+        result["flagged_tools"] = sorted(set(flagged))
+        result["flagged_check_count"] = len(flagged)
+        return result
+
+    @staticmethod
+    def _format_image_forensics_precheck(precheck: dict[str, Any]) -> str:
+        """Format deterministic image-forensics output for the YAML task prompt."""
+        if precheck.get("status") == "no_input":
+            return "⚠️ 图像取证预检未执行：没有可读取的本地图片或面板路径。"
+
+        counts = precheck.get("input_counts", {})
+        coverage = precheck.get("coverage", {})
+        lines = [
+            "### 图像取证工具预检（系统已确定性执行）",
+            "",
+            f"- 可读取图片：{counts.get('images_existing', 0)}/"
+            f"{counts.get('images_total', 0)}",
+            f"- 可读取面板：{counts.get('panels_existing', 0)}/"
+            f"{counts.get('panels_total', 0)}",
+            f"- 单图取证覆盖：{coverage.get('single_image_tools_analyzed', 0)} 张"
+            f"（因安全上限省略 {coverage.get('single_image_tools_omitted', 0)} 张）",
+            f"- 整图 pHash 跨图比对覆盖：{coverage.get('cross_image_paths_analyzed', 0)} 张"
+            f"（省略 {coverage.get('cross_image_paths_omitted', 0)} 张）",
+            f"- 面板 SIFT/RANSAC 比对覆盖：{coverage.get('feature_panel_paths_analyzed', 0)} 个面板"
+            f"（省略 {coverage.get('feature_panel_paths_omitted', 0)} 个）",
+            f"- 已尝试工具：{', '.join(precheck.get('tools_attempted', [])) or '无'}",
+            f"- 阳性工具：{', '.join(precheck.get('flagged_tools', [])) or '无'}",
+        ]
+
+        cross = precheck.get("cross_image_duplicate", {})
+        feature = precheck.get("feature_based_duplicate", {})
+        lines.extend([
+            "",
+            "#### 整图跨图重复检测",
+            f"- 工具：{cross.get('tool', 'cross_image_duplicate_check')}",
+            f"- 状态：{cross.get('status', 'unknown')}",
+            f"- flagged：{cross.get('output', {}).get('flagged', False)}",
+            f"- match_count：{cross.get('output', {}).get('match_count', 0)}",
+            "",
+            "#### 面板级特征重复检测",
+            f"- 工具：{feature.get('tool', 'feature_based_duplicate_check')}",
+            f"- 状态：{feature.get('status', 'unknown')}",
+            f"- flagged：{feature.get('output', {}).get('flagged', False)}",
+            f"- match_count：{feature.get('output', {}).get('match_count', 0)}",
+        ])
+        return "\n".join(lines)
+
+    def _inject_image_forensics_precheck(self, inputs: dict) -> None:
+        """Run deterministic image-forensics precheck and inject task context."""
+        try:
+            payload = inputs.get("local_paper_payload") or {}
+            precheck = self._run_image_forensics_precheck(payload)
+            inputs["image_forensics_precheck"] = self._format_image_forensics_precheck(precheck)
+            inputs["image_forensics_precheck_json"] = self._json_for_task(precheck)
+        except Exception as e:
+            logger.warning("Image forensics precheck failed: %s", e)
+            precheck = {"status": "error", "error": str(e)}
+            inputs["image_forensics_precheck"] = (
+                "⚠️ 图像取证工具预检未能完成（技术错误）。"
+                f"错误信息：{e}"
+            )
+            inputs["image_forensics_precheck_json"] = self._json_for_task(precheck)
+
+    def _inject_local_paper_payload(self, inputs: dict, pdf_path: str) -> None:
+        """Preload local PDF deterministically and inject structured task context."""
+        logger.info("Preloading local PDF via LocalPaperLoaderTool: %s", pdf_path)
+        try:
+            raw_output = self._local_paper_loader._run(pdf_path)
+            payload = self._coerce_local_paper_payload(raw_output, pdf_path)
+            inputs["local_paper_payload"] = payload
+            inputs["local_paper_payload_json"] = self._json_for_task(payload)
+            inputs["local_paper_load_status"] = "error" if payload.get("error") else "success"
+            inputs["local_paper_load_error"] = str(payload.get("error") or "")
+            inputs["local_paper_summary"] = payload.get("_summary", "")
+            inputs["local_paper_images_json"] = self._json_for_task(payload.get("images", []))
+            inputs["local_paper_panels_json"] = self._json_for_task(payload.get("panels", []))
+            inputs["local_paper_stats_json"] = self._json_for_task(
+                self._local_paper_stats_payload(payload)
+            )
+            inputs["local_paper_text"] = payload.get("full_text") or ""
+            logger.info(
+                "Local PDF preload complete: %s images, %s panels, %s chars text",
+                len(payload.get("images") or []),
+                len(payload.get("panels") or []),
+                payload.get("full_text_length_chars", 0),
+            )
+        except Exception as e:
+            logger.warning("Local PDF preload failed: %s", e)
+            payload = {
+                "source": "local_pdf",
+                "file_path": pdf_path,
+                "full_text_available": False,
+                "full_text": None,
+                "images": [],
+                "panels": [],
+                "tables": [],
+                "pre_extracted_stats": {},
+                "mineru": {"used": False},
+                "error": str(e),
+            }
+            inputs["local_paper_payload"] = payload
+            inputs["local_paper_payload_json"] = self._json_for_task(payload)
+            inputs["local_paper_load_status"] = "error"
+            inputs["local_paper_load_error"] = str(e)
+            inputs["local_paper_summary"] = ""
+            inputs["local_paper_images_json"] = "[]"
+            inputs["local_paper_panels_json"] = "[]"
+            inputs["local_paper_stats_json"] = self._json_for_task(
+                self._local_paper_stats_payload(payload)
+            )
+            inputs["local_paper_text"] = ""
+
+    # ═══════════════════════════════════════════════════════════════════
     # Hooks
     # ═══════════════════════════════════════════════════════════════════
 
@@ -540,6 +903,19 @@ class AcademicFraudDetectionCrew:
 
         # Inject auto-generated values needed by task templates
         inputs.setdefault("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
+        inputs.setdefault("local_paper_payload", {})
+        inputs.setdefault("local_paper_payload_json", "{}")
+        inputs.setdefault("local_paper_load_status", "not_applicable")
+        inputs.setdefault("local_paper_load_error", "")
+        inputs.setdefault("local_paper_summary", "")
+        inputs.setdefault("local_paper_images_json", "[]")
+        inputs.setdefault("local_paper_panels_json", "[]")
+        inputs.setdefault("local_paper_stats_json", "{}")
+        inputs.setdefault("local_paper_text", "")
+        inputs.setdefault("image_forensics_precheck", "未在当前模式下执行图像取证工具预检。")
+        inputs.setdefault("image_forensics_precheck_json", "{}")
+        inputs.setdefault("cross_figure_precheck", "未在当前模式下执行 cross-figure 预比对。")
+        inputs.setdefault("cross_figure_precheck_json", "{}")
 
         # ── Run cross-figure precheck for local PDF mode ───────────────
         # This is a DETERMINISTIC code-level pipeline that guarantees
@@ -547,6 +923,8 @@ class AcademicFraudDetectionCrew:
         # before the LLM agents start, regardless of agent behavior.
         if inputs["identifier_type"] == "local_pdf":
             pdf_path = inputs["paper_identifier"]
+            self._inject_local_paper_payload(inputs, pdf_path)
+            self._inject_image_forensics_precheck(inputs)
             logger.info(f"Running cross-figure precheck on {pdf_path}...")
             try:
                 from .utils.cross_figure_pipeline import (
@@ -554,7 +932,24 @@ class AcademicFraudDetectionCrew:
                     format_precheck_for_agent,
                 )
 
-                precheck_result = run_cross_figure_pipeline(pdf_path)
+                local_payload = inputs.get("local_paper_payload") or {}
+                image_output_dir = None
+                preloaded_images = None
+                if isinstance(local_payload, dict):
+                    mineru_payload = local_payload.get("mineru") or {}
+                    image_output_dir = (
+                        local_payload.get("image_output_dir")
+                        or mineru_payload.get("cache_dir")
+                    )
+                    payload_images = local_payload.get("images")
+                    if payload_images or mineru_payload.get("used"):
+                        preloaded_images = payload_images or []
+
+                precheck_result = run_cross_figure_pipeline(
+                    pdf_path,
+                    images_dir=image_output_dir,
+                    images=preloaded_images,
+                )
                 formatted = format_precheck_for_agent(precheck_result)
 
                 # Inject both formatted text (for task context) and raw JSON

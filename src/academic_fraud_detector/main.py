@@ -38,8 +38,8 @@ load_dotenv()
 # Workaround for Windows GBK terminal
 if sys.platform == "win32":
     try:
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace") # type: ignore
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace") # type: ignore
     except Exception:
         pass
 

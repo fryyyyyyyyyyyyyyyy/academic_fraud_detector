@@ -29,12 +29,23 @@ acquire_target_paper:
     获取被调查论文的完整元数据和尽可能多的全文内容。
 
     ### 如果 identifier_type 是 "local_pdf"：
-    论文为本地 PDF 文件。使用 `local_paper_loader` 工具：
-    1. 从 {paper_identifier} 加载 PDF 并提取所有文本。
-    2. 提取所有嵌入图像（保存到磁盘供取证分析使用）。
-    3. 提取所有表格及其数值数据。
-    4. 预提取 p 值、均值±SD 和其他统计数据。
-    5. 按以下期望输出格式整理。
+    论文为本地 PDF 文件。系统已在任务启动前确定性运行 `local_paper_loader`，
+    请首先使用以下预加载结果，不要重复调用工具，除非状态为 error 或 JSON 明显缺失关键字段。
+
+    - local_paper_load_status: {local_paper_load_status}
+    - local_paper_load_error: {local_paper_load_error}
+    - local_paper_summary: {local_paper_summary}
+
+    预加载 JSON（必须保留其中的 full_text、images、panels、tables、pre_extracted_stats、mineru 字段）：
+
+    {local_paper_payload_json}
+
+    你的任务是将上述 JSON 整理为下方 expected_output 的结构化结果，并确保下游任务能看到：
+    1. 全文 Markdown/文本（`full_text`）。
+    2. 所有本地图片路径（`images[*].filepath`，包括 MinerU 缓存图片和 PyMuPDF 图片）。
+    3. 所有独立面板路径（`panels`）。
+    4. 所有表格和预提取统计数据（`tables`、`pre_extracted_stats`）。
+    5. MinerU 解析状态和缓存路径（`mineru`）。
     **切勿调用外部 API 工具**（arxiv_search、crossref_search、semantic_scholar_search）。
 
     ### 如果 identifier_type 不是 "local_pdf"：
@@ -65,7 +76,11 @@ acquire_target_paper:
       "full_text_available": true/false,
       "full_text": "全文内容" 或 null,
       "figures": [{"number": 1, "caption": "图注", "url": "路径或URL"}],
+      "images": [{"filename": "...", "filepath": "本地图片路径", "source": "mineru|pymupdf", "width": ..., "height": ...}],
+      "panels": ["本地独立面板路径1", "本地独立面板路径2"],
       "tables": [{"number": 1, "caption": "表注", "rows": [...], "columns": [...]}],
+      "pre_extracted_stats": {"p_values": [...], "means_and_sds": [...], "numeric_values": [...]},
+      "mineru": {"used": true/false, "cache_dir": "...", "full_md_path": "...", "image_count": ...},
       "references": [{"title": "...", "doi": "...", "authors": [...]}],
       "citation_count": 数字,
       "source_apis_used": ["arxiv", "crossref", "semantic_scholar"],
@@ -170,12 +185,46 @@ image_forensics_investigation:
 
     分析目标论文中所有图表、图像和图形数据，检测是否存在篡改或伪造。
 
+    ### 本地 PDF 预加载图像输入（必须优先使用）
+
+    系统已在启动前解析 PDF，并提取本地图片和面板路径：
+
+    - images JSON: {local_paper_images_json}
+    - panels JSON: {local_paper_panels_json}
+
+    如果上述 JSON 中包含图片或面板路径，禁止报告“图像数为 0”或“未获得图像路径”。
+    必须优先使用这些 `filepath` / panel 路径调用图像取证工具；只有在 JSON 为空或路径无法读取时，
+    才能说明图像输入缺失，并应引用具体错误。
+
+    ### 🔴 图像取证工具预检结果（系统已确定性执行，必须优先采用）
+
+    为避免 Agent 只描述方法但未实际调用工具，系统已在代码层面预先调用图像取证工具，
+    并把工具返回的原始 JSON 注入到本任务。你必须先读取这些结果；不得再写“当前环境未提供
+    可调用的图像取证工具接口”。
+
+    预检摘要：
+
+    {image_forensics_precheck}
+
+    预检原始 JSON（用于核对每个工具的 status、flagged、match_count、raw output 和覆盖范围）：
+
+    {image_forensics_precheck_json}
+
+    使用规则：
+    - 如果预检 JSON 中某个工具 status=success，说明该工具已经实际执行；必须引用其 output。
+    - 如果 status=error，说明工具被调用但执行报错；必须报告具体 error，不能当作阴性结果。
+    - 如果 status=skipped 或 coverage 显示存在 omitted 项，必须说明覆盖范围和未覆盖数量。
+    - 只有工具 output.flagged=true 或 matches 非空时，才可形成阳性图像证据。
+    - 如果预检已覆盖的工具全部 flagged=false，可写“已执行工具未发现异常”；不得写“未执行”。
+
     ### 方法
     1. **清点**：从论文元数据提取所有图像/图表 URL。如果论文有 PDF，提取嵌入的图片。
        统计并编目所有图表。注意：PDF 加载后，`panels` 字段包含已自动分割的独立面板路径，
        这些面板是从复合图中拆分出来的子图。
 
-    2. **下载**：使用 image_downloader 工具批量下载所有图表。本地缓存。验证图像完整性。
+    2. **读取图像路径**：本地 PDF 模式不要下载图像，直接使用预加载 JSON 中的本地 `filepath`
+       和 panel 路径；如果是远程 URL，只能使用当前 Agent 已注册的图像工具自行读取 URL，不要声称存在
+       未注册的 `image_downloader` 工具。
 
     3. **对每张图像执行以下分析**：
        a) **误差水平分析 (ELA)**：检测 JPEG 压缩差异导致的编辑痕迹。使用 `error_level_analysis` 工具。
@@ -266,6 +315,16 @@ image_forensics_investigation:
           "interpretation": "同一张图内面板重复使用的分析"
         }
       ],
+      "tool_invocations": [
+        {
+          "tool_name": "error_level_analysis|clone_detection|ai_image_detection|background_consistency_check|cross_image_duplicate_check|feature_based_duplicate_check",
+          "status": "success|error|skipped",
+          "input_summary": "图片/面板路径或数量",
+          "flagged": true,
+          "raw_output_excerpt": "工具原始 JSON 的关键字段"
+        }
+      ],
+      "coverage_limitations": ["如存在 omitted 或 skipped，在此逐项说明"],
       "category_risk_score": 0-100,
       "total_checks": ...,
       "flagged_checks": ...
@@ -296,6 +355,14 @@ data_integrity_investigation:
     以下是完整的预计算结果：
 
     {cross_figure_precheck}
+
+    预比对原始 JSON（用于核对 datasets、matches、统计预检字段）：
+
+    {cross_figure_precheck_json}
+
+    PDF 预加载提取的表格、统计值和解析状态如下（必须优先使用）：
+
+    {local_paper_stats_json}
 
     ### 🚨 关键评分规则（必须严格遵守）
 
@@ -519,6 +586,14 @@ methodology_audit:
 
     审查论文实验方法部分的内部一致性和逻辑合理性。这是"第六式：方法矛盾检测"
     的核心 — 很多造假论文的方法部分经不起仔细推敲。
+
+    ### 本地 PDF 预加载正文（必须优先使用）
+
+    系统已在启动前提取 PDF 正文。local_paper_load_status={local_paper_load_status}。
+    如果状态为 success，必须从以下正文中定位 Methods、Results、图注、伦理声明和试剂/设备信息；
+    不得因为缺少外部数据库元数据而跳过方法论审查。
+
+    {local_paper_text}
 
     ### 方法
 
@@ -1039,18 +1114,36 @@ local_synthesize_findings:
     引用网络分析和同行评审调查均未执行（需外部 API）。
     切勿为缺失的类别编造发现 — 如实标注为"未调查"并说明原因。
 
+    ### 本地 PDF 加载状态核查（必须执行）
+
+    - local_paper_load_status: {local_paper_load_status}
+    - local_paper_load_error: {local_paper_load_error}
+    - local_paper_summary: {local_paper_summary}
+    - images: {local_paper_images_json}
+    - panels: {local_paper_panels_json}
+    - image_forensics_precheck: {image_forensics_precheck}
+    - image_forensics_precheck_json: {image_forensics_precheck_json}
+
+    如果 local_paper_load_status 为 success，且 images/panels 非空，最终报告不得写“无法访问本地 PDF”或
+    “未获得图像路径”。如果图像取证预检 JSON 中存在 tools_attempted，最终报告不得写“图像取证工具未实际执行”或
+    “当前环境未提供可调用工具接口”；应按 status 区分 success/error/skipped，并引用预检 JSON 的工具输出。
+
     ### 🚨 交叉验证步骤（必须在评分前执行）
 
     在读入各 Agent 报告后，你必须对每项发现执行以下验证：
 
     1. **图像取证发现验证**：
        - 对于每项图像相关发现，检查是否附带了**具体工具名称**和**工具返回的客观数据**。
-       - ✅ 有效证据："cross_image_duplicate_check 返回 Figure1_panel0 与 Figure4_panel0
+       - ✅ 有效证据："cross_image_duplicate_check 返回 Figure1_panel0 与 Figure4A_panel0
          匹配，Hamming distance=2, confidence=very_high"
        - ❌ 无效证据："图1和图4看起来相似"、"经视觉比对发现"、"疑似同一图片" → 标记为
          "证据不足，从报告中剔除"
-       - 如果图像取证报告中的所有发现都没有工具输出作为支撑，该维度的风险评分
-         必须设为 10-15 分（无风险），并在报告中明确说明"图像取证工具未检测到异常"。
+       - 必须同时核对 `image_forensics_precheck_json`：如果其中已有 tools_attempted，说明工具已在
+         代码层实际调用，最终报告应转录 success/error/skipped 状态和覆盖范围。
+       - 如果图像取证报告没有正确使用预检结果，你必须用 `image_forensics_precheck_json` 纠正它，
+         不得沿用“工具未执行/接口不可用”的错误说法。
+       - 只有在工具实际返回 flagged=false 且无 matches 时，才能说明“已执行工具未发现异常”；
+         如果工具 status=error 或 skipped，只能作为流程限制说明，不能当作阴性证据。
 
     2. **数据完整性发现验证**：
        - ⚠️ **系统已在代码层面确定性执行了所有统计检验**（Benford、p值分布、

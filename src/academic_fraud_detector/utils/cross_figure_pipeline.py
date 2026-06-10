@@ -23,7 +23,6 @@ The agent can no longer skip these steps — the data is already extracted
 and the statistical tests are already run.
 """
 
-import json
 import logging
 import os
 import re
@@ -61,6 +60,7 @@ KNOWN_RISK_PAIRS: List[Dict[str, Any]] = [
 def run_cross_figure_pipeline(
     pdf_path: str,
     images_dir: Optional[str] = None,
+    images: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Deterministic pre-processing: extract bar chart data, run cross-figure
@@ -81,13 +81,16 @@ def run_cross_figure_pipeline(
         "guidance": "",
         "errors": [],
     }
+    bar_candidates = []
+    datasets = []
+    matches = []
 
     # ── Step 1: Build page→figure mapping ─────────────────────────────
     page_fig_map = _build_page_figure_map(pdf_path)
     result["page_fig_map"] = {str(k): v for k, v in page_fig_map.items()}
 
     # ── Step 2: Get all panel images with metadata ────────────────────
-    panels = _get_all_panel_images(pdf_path, images_dir, page_fig_map)
+    panels = _get_all_panel_images(pdf_path, images_dir, page_fig_map, images=images)
     result["panels"] = panels
 
     # ── Step 3: Identify likely bar chart panels ──────────────────────
@@ -208,18 +211,137 @@ def _get_all_panel_images(
     pdf_path: str,
     images_dir: Optional[str],
     page_fig_map: Dict[int, str],
+    images: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Discover all panel images with metadata."""
+    """Discover all panel images with metadata without scanning historical caches."""
 
-    if images_dir:
-        panels_dir = Path(images_dir) / "panels"
-    else:
-        from ..utils.text_extraction import DEFAULT_IMAGE_OUTPUT_DIR
-        panels_dir = DEFAULT_IMAGE_OUTPUT_DIR / "panels"
+    def append_saved_panel(panel: Dict[str, Any], figure: Optional[Dict[str, Any]] = None) -> None:
+        panel_path = panel.get("filepath", "")
+        if not panel_path or not os.path.exists(panel_path):
+            return
 
-    panels = []
+        info = _parse_panel_filename(os.path.basename(panel_path)) or {}
+        figure = figure or {}
+        pdf_page = (
+            panel.get("pdf_page")
+            or panel.get("page_number")
+            or figure.get("pdf_page")
+            or figure.get("page_number")
+            or info.get("pdf_page")
+            or 0
+        )
+        panel_idx = panel.get("panel_index", info.get("panel_index", -1))
+        fig_label = page_fig_map.get(pdf_page, f"Page{pdf_page}")
+        letter = chr(ord("A") + panel_idx) if 0 <= panel_idx < 26 else "?"
+        try:
+            with Image.open(panel_path) as img:
+                w, h = img.size
+        except Exception:
+            w, h = 0, 0
+        panels.append({
+            "filepath": panel_path,
+            "filename": os.path.basename(panel_path),
+            "pdf_page": pdf_page,
+            "panel_index": panel_idx,
+            "figure_label": fig_label,
+            "panel_letter": letter,
+            "full_label": f"{fig_label}{letter}",
+            "width": panel.get("width", w),
+            "height": panel.get("height", h),
+            "source": panel.get("source") or figure.get("source"),
+            "source_image_filename": panel.get("source_image_filename") or figure.get("filename"),
+        })
 
-    if panels_dir.exists():
+    panels: List[Dict[str, Any]] = []
+
+    def append_existing_panels_for_images(
+        output_dir: str | Path,
+        figures: List[Dict[str, Any]],
+    ) -> None:
+        """Reuse panels already split for the current MinerU/PyMuPDF image set."""
+        panels_dir = Path(output_dir) / "panels"
+        if not panels_dir.exists():
+            return
+
+        seen: set[tuple[str, int]] = set()
+        for image_idx, figure in enumerate(figures):
+            image_path = figure.get("filepath")
+            base_filename = (
+                figure.get("filename")
+                or (Path(str(image_path)).name if image_path else "")
+                or f"image_{image_idx + 1}"
+            )
+            base_name = Path(str(base_filename)).stem
+            if not base_name:
+                continue
+
+            panel_name_pattern = re.compile(
+                rf"^{re.escape(base_name)}_panel_(\d+)(?:_(\d+))?\.png$",
+                re.IGNORECASE,
+            )
+            candidates = []
+            for panel_path in panels_dir.glob(f"{base_name}_panel_*.png"):
+                match = panel_name_pattern.match(panel_path.name)
+                if not match:
+                    continue
+                panel_idx = int(match.group(1))
+                duplicate_idx = int(match.group(2) or 0)
+                candidates.append((panel_idx, duplicate_idx, panel_path))
+
+            for panel_idx, _, panel_path in sorted(
+                candidates,
+                key=lambda item: (item[0], item[1], item[2].name.lower()),
+            ):
+                dedupe_key = (base_name, panel_idx)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                append_saved_panel({
+                    "filepath": str(panel_path.absolute()),
+                    "filename": panel_path.name,
+                    "panel_index": panel_idx,
+                    "pdf_page": figure.get("pdf_page") or figure.get("page_number"),
+                    "page_number": figure.get("page_number") or figure.get("pdf_page"),
+                    "source": figure.get("source"),
+                    "source_image_filename": figure.get("filename"),
+                }, figure)
+
+    if images is not None:
+        try:
+            from ..utils.text_extraction import create_unique_image_output_dir
+
+            output_dir = images_dir or str(create_unique_image_output_dir(
+                prefix="cross_figure",
+                source_name=Path(pdf_path).name,
+            ))
+            append_existing_panels_for_images(output_dir, images)
+            if panels:
+                panels.sort(key=lambda p: (p.get("pdf_page", 999), p.get("panel_index", 999)))
+                logger.info(
+                    "_get_all_panel_images: reusing %d existing panels from %s",
+                    len(panels),
+                    Path(output_dir) / "panels",
+                )
+                return panels
+
+            from ..utils.figure_splitter import extract_all_panels_from_images
+
+            all_figures = extract_all_panels_from_images(
+                images,
+                output_dir=output_dir,
+            )
+            for fig in all_figures:
+                for panel in fig.get("panels", []):
+                    append_saved_panel(panel, fig)
+        except Exception as e:
+            logger.warning(f"Panel extraction from preloaded images failed: {e}")
+
+        logger.info(f"_get_all_panel_images: {len(panels)} unique panels found")
+        return panels
+
+    panels_dir = Path(images_dir) / "panels" if images_dir else None
+
+    if panels_dir and panels_dir.exists():
         resolution_groups: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = {}
         for pf in sorted(panels_dir.glob("*.png")):
             info = _parse_panel_filename(pf.name)
@@ -245,60 +367,26 @@ def _get_all_panel_images(
             best_panels = res_list[0][1]
 
             for panel_data in best_panels:
-                try:
-                    img = Image.open(panel_data["filepath"])
-                    panel_data["width"], panel_data["height"] = img.size
-                except Exception:
-                    panel_data["width"], panel_data["height"] = 0, 0
-
-                fig_label = page_fig_map.get(pdf_page, f"Page{pdf_page}")
-                panel_data["figure_label"] = fig_label
-
-                panel_idx = panel_data.get("panel_index", -1)
-                if 0 <= panel_idx < 26:
-                    panel_data["panel_letter"] = chr(ord("A") + panel_idx)
-                else:
-                    panel_data["panel_letter"] = str(panel_idx + 1) if panel_idx >= 0 else "?"
-
-                panel_data["full_label"] = f"{fig_label}{panel_data['panel_letter']}"
-
-                panels.append(panel_data)
+                append_saved_panel(panel_data)
 
         panels.sort(key=lambda p: (p.get("pdf_page", 999), p.get("panel_index", 999)))
 
     if not panels:
         try:
             from ..utils.figure_splitter import extract_all_panels_from_pdf
+            from ..utils.text_extraction import create_unique_image_output_dir
+
+            output_dir = images_dir or str(create_unique_image_output_dir(
+                prefix="cross_figure",
+                source_name=Path(pdf_path).name,
+            ))
             all_figures = extract_all_panels_from_pdf(
                 pdf_path,
-                output_dir=str(panels_dir.parent) if images_dir else None,
+                output_dir=output_dir,
             )
             for fig in all_figures:
-                fig_panels = fig.get("panels", [])
-                for p in fig_panels:
-                    panel_path = p.get("filepath", "")
-                    if panel_path and os.path.exists(panel_path):
-                        info = _parse_panel_filename(os.path.basename(panel_path)) or {}
-                        pdf_page = info.get("pdf_page", 0)
-                        panel_idx = info.get("panel_index", p.get("panel_index", -1))
-                        fig_label = page_fig_map.get(pdf_page, f"Page{pdf_page}")
-                        letter = chr(ord("A") + panel_idx) if 0 <= panel_idx < 26 else "?"
-                        try:
-                            img = Image.open(panel_path)
-                            w, h = img.size
-                        except Exception:
-                            w, h = 0, 0
-                        panels.append({
-                            "filepath": panel_path,
-                            "filename": os.path.basename(panel_path),
-                            "pdf_page": pdf_page,
-                            "panel_index": panel_idx,
-                            "figure_label": fig_label,
-                            "panel_letter": letter,
-                            "full_label": f"{fig_label}{letter}",
-                            "width": w,
-                            "height": h,
-                        })
+                for panel in fig.get("panels", []):
+                    append_saved_panel(panel, fig)
         except Exception as e:
             logger.warning(f"Panel extraction from PDF failed: {e}")
 
@@ -1034,7 +1122,6 @@ def _run_statistical_prechecks(
     means = list(text_values.get("means", []))
     sds = list(text_values.get("sds", []))
     p_values = list(text_values.get("p_values", []))
-    percentages = list(text_values.get("percentages", []))
     mean_sd_pairs = list(text_values.get("mean_sd_pairs", []))
 
     # ── 1. Benford's Law ──
@@ -1490,10 +1577,10 @@ def _detect_arithmetic_progressions(
                     f"R²对完美等差数列={r_squared:.6f}。"
                     f"差值: {[round(float(d), 2) for d in diffs]}。"
                     + (
-                        f"差值近乎恒定 — 典型的近似等差数列特征，"
-                        f"这是人为编造数据的最强信号之一。"
+                        "差值近乎恒定 — 典型的近似等差数列特征，"
+                        "这是人为编造数据的最强信号之一。"
                         if cv_diff < 0.15
-                        else f"差值较为一致，存在编造可能性。"
+                        else "差值较为一致，存在编造可能性。"
                     )
                 ),
             })
@@ -1605,7 +1692,7 @@ def _generate_enhanced_guidance(
     lines.append("")
 
     # ── Summary ──
-    lines.append(f"### 数据提取摘要")
+    lines.append("### 数据提取摘要")
     lines.append(f"- PDF面板总数：**{len(panels)}** 个")
     lines.append(f"- 柱状图候选：**{len(bar_candidates)}** 个")
     lines.append(f"- 成功提取数据集：**{len([d for d in datasets if d.get('values')])}** 个")
@@ -1687,7 +1774,7 @@ def _generate_enhanced_guidance(
         lines.append(f"- 解读：{benford.get('interpretation')}")
         lines.append("")
     else:
-        lines.append(f"#### 本福特定律检验")
+        lines.append("#### 本福特定律检验")
         lines.append(f"- 状态：**未执行** — {benford.get('note', '数据不足')}")
         lines.append("")
 
@@ -1703,7 +1790,7 @@ def _generate_enhanced_guidance(
         lines.append(f"- 解读：{pval.get('interpretation')}")
         lines.append("")
     else:
-        lines.append(f"#### p值分布分析")
+        lines.append("#### p值分布分析")
         lines.append(f"- 状态：**未执行** — 精确p值不足（n={pval.get('p_value_count', 0)}）")
         warning = pval.get("warning", "")
         if warning:
@@ -1720,7 +1807,7 @@ def _generate_enhanced_guidance(
             lines.append(f"  - {r.get('detail', '')}")
         lines.append("")
     else:
-        lines.append(f"#### GRIM检验")
+        lines.append("#### GRIM检验")
         lines.append(f"- 状态：**未执行** — {grim.get('note', '无法找到配对')}")
         lines.append("")
 
@@ -1746,7 +1833,7 @@ def _generate_enhanced_guidance(
         for f in flags:
             lines.append(f"  - {f}")
     else:
-        lines.append(f"  - ✅ 末位数字分布正常")
+        lines.append("  - ✅ 末位数字分布正常")
 
     ap = anomalous.get("near_arithmetic_progression", {})
     lines.append(f"**近等差数列检测**：检验{ap.get('series_tested', 0)}个序列")
@@ -1755,7 +1842,7 @@ def _generate_enhanced_guidance(
         for detail in ap.get("details", []):
             lines.append(f"  - {detail.get('interpretation', '')}")
     else:
-        lines.append(f"- ✅ 未发现近等差数列特征")
+        lines.append("- ✅ 未发现近等差数列特征")
 
     hr = anomalous.get("high_frequency_repeats", {})
     lines.append(f"**高频重复值检测**：分析{hr.get('n_analyzed', 0)}个数值")
@@ -1763,7 +1850,7 @@ def _generate_enhanced_guidance(
         for r in hr.get("repeats", []):
             lines.append(f"  - 🔴 {r.get('interpretation', '')}")
     else:
-        lines.append(f"- ✅ 未发现异常高频重复值")
+        lines.append("- ✅ 未发现异常高频重复值")
     lines.append("")
 
     # ── All panels by figure ──

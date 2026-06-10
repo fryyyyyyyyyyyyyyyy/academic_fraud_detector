@@ -6,16 +6,24 @@ arXiv, CrossRef, and Semantic Scholar APIs, or load from local PDF files.
 import json
 import os
 import logging
-from typing import Optional, Literal
+import re
+from typing import Any, Optional, Literal
 
 from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
-import requests
 
 from ..utils.api_client import safe_request
-from ..utils.text_extraction import extract_pdf_text, extract_pdf_images
+from ..utils.mineru_client import (
+    MinerUConfigError,
+    MinerUError,
+    extract_pdf_markdown_with_mineru_assets,
+)
+from ..utils.text_extraction import (
+    create_unique_image_output_dir,
+    extract_pdf_text,
+    extract_pdf_images,
+)
 from ..utils.table_extraction import extract_pdf_tables, extract_numeric_values, extract_p_values, extract_means_and_sds
-from ..utils.figure_splitter import split_composite_figure, save_panels_for_tools
 
 logger = logging.getLogger(__name__)
 
@@ -486,7 +494,8 @@ class LocalPaperLoaderTool(BaseTool):
     - Pre-extracted p-values, means, SDs, and other statistics
 
     All extracted data is structured as JSON for downstream agent analysis.
-    No external API calls are made — everything is local.
+    When a MinerU API key is configured, text extraction uses MinerU VLM
+    Markdown first; otherwise it falls back to local PyMuPDF extraction.
     """
 
     name: str = "local_paper_loader"
@@ -500,9 +509,105 @@ class LocalPaperLoaderTool(BaseTool):
         "Use this as the FIRST step when investigating a user-uploaded PDF. "
         "Returns structured JSON with text content, image file paths (for the image "
         "forensics tools), table data, and extracted numeric statistics. "
-        "NO external API calls are made."
+        "When MINERU_API_KEY is configured, converts PDF text to Markdown via "
+        "MinerU VLM first; otherwise falls back to local PyMuPDF extraction."
     )
     args_schema: type[BaseModel] = LocalPaperLoaderInput
+
+    @staticmethod
+    def _count_pdf_pages(pdf_bytes: bytes, max_pages: Optional[int] = None) -> int:
+        """Count PDF pages with PyMuPDF without changing extracted text."""
+        try:
+            import fitz  # PyMuPDF
+
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            page_count = doc.page_count
+            doc.close()
+            if max_pages:
+                page_count = min(page_count, max_pages)
+            return int(page_count)
+        except Exception as e:
+            logger.debug(f"PDF page counting failed: {e}")
+            return 0
+
+    @staticmethod
+    def _pymupdf_images_with_source(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Mark PyMuPDF-extracted images without changing existing metadata."""
+        for image in images:
+            image.setdefault("source", "pymupdf")
+        return images
+
+    @staticmethod
+    def _mineru_images_with_source(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Mark MinerU-extracted images without changing existing metadata."""
+        for image in images:
+            image.setdefault("source", "mineru")
+        return images
+
+    def _extract_mineru_first(
+        self,
+        pdf_bytes: bytes,
+        file_name: str,
+        max_pages: int,
+    ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+        """Extract MinerU Markdown/assets first, then fall back to PyMuPDF text."""
+        try:
+            result = extract_pdf_markdown_with_mineru_assets(
+                pdf_bytes,
+                file_name=file_name,
+                max_pages=max_pages,
+            )
+            if result.markdown.strip():
+                mineru_meta = {
+                    "used": True,
+                    "cache_dir": result.cache_dir,
+                    "full_md_path": result.full_md_path,
+                    "raw_full_md_path": result.raw_full_md_path,
+                    "zip_path": result.zip_path,
+                    "image_count": len(result.images),
+                }
+                return result.markdown, result.images, mineru_meta
+            logger.warning("MinerU returned empty Markdown for %s; falling back to PyMuPDF", file_name)
+            reason = "empty_markdown"
+        except MinerUConfigError:
+            logger.info("MinerU API key not configured; using PyMuPDF for %s", file_name)
+            reason = "not_configured"
+        except MinerUError as e:
+            logger.warning("MinerU extraction failed for %s; falling back to PyMuPDF: %s", file_name, e)
+            reason = type(e).__name__
+        except Exception as e:
+            logger.warning(
+                "Unexpected MinerU extraction error for %s; falling back to PyMuPDF: %s",
+                file_name,
+                e,
+            )
+            reason = "unexpected_error"
+
+        fallback_text = extract_pdf_text(pdf_bytes, max_pages=max_pages)
+        return fallback_text, [], {"used": False, "fallback": "pymupdf", "reason": reason}
+
+    def _extract_text_mineru_first(
+        self,
+        pdf_bytes: bytes,
+        file_name: str,
+        max_pages: int,
+    ) -> str:
+        """Extract PDF text as MinerU Markdown first, then fall back to PyMuPDF."""
+        text, _, _ = self._extract_mineru_first(pdf_bytes, file_name, max_pages)
+        return text
+
+    def _page_count_from_text_or_pdf(
+        self,
+        text: str,
+        pdf_bytes: bytes,
+        max_pages: Optional[int] = None,
+    ) -> int:
+        """Prefer existing [Page N] markers; otherwise count pages from PDF bytes."""
+        page_markers = re.findall(r'\[Page (\d+)\]', text)
+        if page_markers:
+            count = int(page_markers[-1])
+            return min(count, max_pages) if max_pages else count
+        return self._count_pdf_pages(pdf_bytes, max_pages=max_pages)
 
     def _run(
         self,
@@ -534,8 +639,10 @@ class LocalPaperLoaderTool(BaseTool):
             "full_text_length_chars": 0,
             "page_count": 0,
             "images": [],
+            "image_output_dir": None,
             "tables": [],
             "panels": [],
+            "mineru": {"used": False},
             "pre_extracted_stats": {
                 "p_values": [],
                 "means_and_sds": [],
@@ -552,18 +659,25 @@ class LocalPaperLoaderTool(BaseTool):
             result["error"] = f"Failed to read file: {e}"
             return json.dumps(result)
 
+        mineru_images: list[dict[str, Any]] = []
+
         # ── Extract text ──
         try:
-            full_text = extract_pdf_text(pdf_bytes, max_pages=max_pages)
+            full_text, mineru_images, mineru_meta = self._extract_mineru_first(
+                pdf_bytes,
+                file_name=result["file_name"],
+                max_pages=max_pages,
+            )
+            result["mineru"] = mineru_meta
             if full_text.strip():
                 result["full_text_available"] = True
                 result["full_text"] = full_text
                 result["full_text_length_chars"] = len(full_text)
-
-                # Count pages from page markers
-                import re
-                page_markers = re.findall(r'\[Page (\d+)\]', full_text)
-                result["page_count"] = int(page_markers[-1]) if page_markers else 0
+                result["page_count"] = self._page_count_from_text_or_pdf(
+                    full_text,
+                    pdf_bytes,
+                    max_pages=max_pages,
+                )
 
                 # Pre-extract statistical values from text
                 result["pre_extracted_stats"]["p_values"] = [
@@ -576,16 +690,32 @@ class LocalPaperLoaderTool(BaseTool):
 
         # ── Extract images ──
         if extract_images:
-            try:
-                images = extract_pdf_images(
-                    pdf_bytes,
-                    min_size=image_min_size,
-                    max_pages=max_pages,
+            if result.get("mineru", {}).get("used"):
+                result["images"] = self._mineru_images_with_source(mineru_images)
+                result["image_output_dir"] = result["mineru"].get("cache_dir")
+                if not result["images"]:
+                    logger.info(
+                        "MinerU succeeded for %s but returned no cached images; "
+                        "skipping PyMuPDF image extraction by design.",
+                        result["file_name"],
+                    )
+            else:
+                image_output_dir = create_unique_image_output_dir(
+                    prefix="pymupdf_images",
+                    source_name=result["file_name"],
                 )
-                result["images"] = images
-            except Exception as e:
-                logger.warning(f"Image extraction failed: {e}")
-                result["images"] = []
+                result["image_output_dir"] = str(image_output_dir)
+                try:
+                    images = extract_pdf_images(
+                        pdf_bytes,
+                        output_dir=str(image_output_dir),
+                        min_size=image_min_size,
+                        max_pages=max_pages,
+                    )
+                    result["images"] = self._pymupdf_images_with_source(images)
+                except Exception as e:
+                    logger.warning(f"Image extraction failed: {e}")
+                    result["images"] = []
 
         # ── Extract tables ──
         if extract_tables:
@@ -612,13 +742,18 @@ class LocalPaperLoaderTool(BaseTool):
         result["panels"] = []
         if extract_images and result["images"]:
             try:
-                from ..utils.figure_splitter import extract_all_panels_from_pdf
-                panels_data = extract_all_panels_from_pdf(
-                    file_path,
-                    output_dir=None,
+                from ..utils.figure_splitter import extract_all_panels_from_images
+                panel_output_dir = result.get("image_output_dir")
+                if not panel_output_dir:
+                    panel_output_dir = str(create_unique_image_output_dir(
+                        prefix="panels",
+                        source_name=result["file_name"],
+                    ))
+                    result["image_output_dir"] = panel_output_dir
+                panels_data = extract_all_panels_from_images(
+                    result["images"],
+                    output_dir=panel_output_dir,
                     min_panel_size=80,
-                    min_image_size=image_min_size,
-                    max_pages=max_pages,
                 )
                 # Flatten panel paths for easy consumption by forensic tools
                 all_panel_paths = []
@@ -657,6 +792,8 @@ class LocalPaperLoaderTool(BaseTool):
                         "stats": supp_result.get("pre_extracted_stats", {}),
                         "tables": supp_result.get("tables", []),
                         "text_length": supp_result.get("full_text_length_chars", 0),
+                        "image_output_dir": supp_result.get("image_output_dir"),
+                        "mineru": supp_result.get("mineru", {"used": False}),
                     })
                     # Merge numeric data
                     supp_stats = supp_result.get("pre_extracted_stats", {})
@@ -707,9 +844,8 @@ class LocalPaperLoaderTool(BaseTool):
         image_min_size: int,
     ) -> dict:
         """Load a single PDF and return its extracted content as a dict (no JSON)."""
-        from ..utils.text_extraction import extract_pdf_text, extract_pdf_images
         from ..utils.table_extraction import extract_pdf_tables, extract_numeric_values, extract_p_values, extract_means_and_sds
-        from ..utils.figure_splitter import extract_all_panels_from_pdf
+        from ..utils.figure_splitter import extract_all_panels_from_images
 
         with open(file_path, "rb") as f:
             pdf_bytes = f.read()
@@ -720,8 +856,10 @@ class LocalPaperLoaderTool(BaseTool):
             "full_text_length_chars": 0,
             "page_count": 0,
             "images": [],
+            "image_output_dir": None,
             "tables": [],
             "panels": [],
+            "mineru": {"used": False},
             "pre_extracted_stats": {
                 "p_values": [],
                 "means_and_sds": [],
@@ -729,16 +867,25 @@ class LocalPaperLoaderTool(BaseTool):
             },
         }
 
+        mineru_images: list[dict[str, Any]] = []
+
         # Text
         try:
-            text = extract_pdf_text(pdf_bytes, max_pages=max_pages)
+            text, mineru_images, mineru_meta = self._extract_mineru_first(
+                pdf_bytes,
+                file_name=os.path.basename(file_path),
+                max_pages=max_pages,
+            )
+            result["mineru"] = mineru_meta
             if text.strip():
                 result["full_text_available"] = True
                 result["full_text"] = text
                 result["full_text_length_chars"] = len(text)
-                import re
-                markers = re.findall(r'\[Page (\d+)\]', text)
-                result["page_count"] = int(markers[-1]) if markers else 0
+                result["page_count"] = self._page_count_from_text_or_pdf(
+                    text,
+                    pdf_bytes,
+                    max_pages=max_pages,
+                )
                 result["pre_extracted_stats"]["p_values"] = [
                     round(v, 6) for v in extract_p_values(text)
                 ]
@@ -748,10 +895,32 @@ class LocalPaperLoaderTool(BaseTool):
 
         # Images
         if extract_images:
-            try:
-                result["images"] = extract_pdf_images(pdf_bytes, min_size=image_min_size, max_pages=max_pages)
-            except Exception as e:
-                logger.warning(f"Supp image extraction failed: {e}")
+            if result.get("mineru", {}).get("used"):
+                result["images"] = self._mineru_images_with_source(mineru_images)
+                result["image_output_dir"] = result["mineru"].get("cache_dir")
+                if not result["images"]:
+                    logger.info(
+                        "MinerU succeeded for supplementary file %s but returned no cached images; "
+                        "skipping PyMuPDF image extraction by design.",
+                        os.path.basename(file_path),
+                    )
+            else:
+                image_output_dir = create_unique_image_output_dir(
+                    prefix="pymupdf_images",
+                    source_name=os.path.basename(file_path),
+                )
+                result["image_output_dir"] = str(image_output_dir)
+                try:
+                    pymupdf_images = extract_pdf_images(
+                        pdf_bytes,
+                        output_dir=str(image_output_dir),
+                        min_size=image_min_size,
+                        max_pages=max_pages,
+                    )
+                    result["images"] = self._pymupdf_images_with_source(pymupdf_images)
+                except Exception as e:
+                    logger.warning(f"Supp image extraction failed: {e}")
+                    result["images"] = []
 
         # Tables
         if extract_tables:
@@ -770,9 +939,17 @@ class LocalPaperLoaderTool(BaseTool):
         # Panels
         if extract_images and result["images"]:
             try:
-                panels_data = extract_all_panels_from_pdf(
-                    file_path, output_dir=None, min_panel_size=80,
-                    min_image_size=image_min_size, max_pages=max_pages,
+                panel_output_dir = result.get("image_output_dir")
+                if not panel_output_dir:
+                    panel_output_dir = str(create_unique_image_output_dir(
+                        prefix="panels",
+                        source_name=os.path.basename(file_path),
+                    ))
+                    result["image_output_dir"] = panel_output_dir
+                panels_data = extract_all_panels_from_images(
+                    result["images"],
+                    output_dir=panel_output_dir,
+                    min_panel_size=80,
                 )
                 for entry in panels_data:
                     for panel in entry.get("panels", []):

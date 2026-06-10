@@ -6,17 +6,48 @@ Provides a unified extract() interface that all tools can use.
 """
 
 import logging
-import os
+import re
+import uuid
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
-from io import BytesIO
 from pathlib import Path
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-# Default output directory for extracted images
+# Default root directory for extracted images. Each extraction uses a unique child directory.
 DEFAULT_IMAGE_OUTPUT_DIR = Path.home() / ".cache" / "academic_fraud_detector" / "extracted_images"
+
+
+def _safe_output_slug(value: Optional[str], default: str) -> str:
+    """Build a filesystem-safe slug for extraction cache directories."""
+    raw = Path(value).stem if value else default
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._-")
+    return (slug or default)[:80]
+
+
+def create_unique_image_output_dir(
+    base_dir: Optional[str | Path] = None,
+    prefix: str = "pdf_images",
+    source_name: Optional[str] = None,
+) -> Path:
+    """Create a unique image extraction directory under the configured cache root."""
+    root = Path(base_dir) if base_dir else DEFAULT_IMAGE_OUTPUT_DIR
+    safe_stem = _safe_output_slug(source_name, prefix)
+
+    for _ in range(10):
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        output_dir = root / f"{safe_stem}_{timestamp}_{uuid.uuid4().hex[:8]}"
+        try:
+            output_dir.mkdir(parents=True, exist_ok=False)
+            return output_dir
+        except FileExistsError:
+            continue
+
+    output_dir = root / f"{safe_stem}_{uuid.uuid4().hex}"
+    output_dir.mkdir(parents=True, exist_ok=False)
+    return output_dir
 
 
 def extract_pdf_text(pdf_content: bytes, max_pages: Optional[int] = None) -> str:
@@ -82,7 +113,7 @@ def extract_pdf_images(
 
     Args:
         pdf_content: Raw PDF bytes.
-        output_dir: Directory to save extracted images. Uses default cache if None.
+        output_dir: Directory to save extracted images. If None, creates a unique cache directory.
         min_size: Minimum image dimension in pixels to keep.
         max_pages: Maximum number of pages to process (None = all).
 
@@ -102,7 +133,7 @@ def extract_pdf_images(
         logger.error("PyMuPDF (fitz) is not installed. Install with: pip install pymupdf")
         return []
 
-    save_dir = Path(output_dir) if output_dir else DEFAULT_IMAGE_OUTPUT_DIR
+    save_dir = Path(output_dir) if output_dir else create_unique_image_output_dir()
     save_dir.mkdir(parents=True, exist_ok=True)
 
     doc = fitz.open(stream=pdf_content, filetype="pdf")
