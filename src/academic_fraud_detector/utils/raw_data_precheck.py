@@ -13,6 +13,8 @@ from scipy import stats
 
 SEVERITY_ORDER = {"informational": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 MAX_EVIDENCE_ITEMS_FOR_CONTEXT = 300
+MAX_POSITIONWISE_DATASET_PAIRS = 5000
+MAX_FRAGMENT_DATASET_PAIRS = 5000
 
 
 def _clean_values(dataset: dict[str, Any]) -> np.ndarray:
@@ -27,6 +29,19 @@ def _clean_values(dataset: dict[str, Any]) -> np.ndarray:
     return np.asarray(values, dtype=np.float64)
 
 
+def _is_low_information_numeric_series(values: np.ndarray) -> bool:
+    """判断序列是否主要由 0 占位组成，不适合作为跨数据集重复证据。"""
+    if len(values) < 5:
+        return True
+    zero_mask = np.isclose(values, 0.0, rtol=0.0, atol=1e-12)
+    zero_count = int(np.sum(zero_mask))
+    if zero_count == len(values):
+        return True
+    nonzero_count = len(values) - zero_count
+    zero_ratio = zero_count / len(values)
+    return zero_ratio >= 0.8 and nonzero_count < 5
+
+
 def _source_location(dataset: dict[str, Any]) -> dict[str, Any]:
     source = dataset.get("source") or {}
     return {
@@ -36,6 +51,9 @@ def _source_location(dataset: dict[str, Any]) -> dict[str, Any]:
         "range": source.get("range", ""),
         "orientation": source.get("orientation", ""),
         "header": source.get("header", ""),
+        "table_id": source.get("table_id", ""),
+        "table_range": source.get("table_range", ""),
+        "table_title": source.get("table_title", ""),
     }
 
 
@@ -127,6 +145,136 @@ def _downgrade(severity: str) -> str:
     return order[index]
 
 
+def _raw_texts(dataset: dict[str, Any]) -> list[str]:
+    raw_values = list(dataset.get("raw_values") or [])
+    values = list(dataset.get("values") or [])
+    result: list[str] = []
+    for index in range(max(len(raw_values), len(values))):
+        if index < len(raw_values) and raw_values[index] not in (None, ""):
+            result.append(str(raw_values[index]).strip())
+        elif index < len(values):
+            result.append(str(values[index]).strip())
+        else:
+            result.append("")
+    return result
+
+
+def _decimal_suffixes(dataset: dict[str, Any], suffix_length: int) -> list[str | None]:
+    suffixes = (dataset.get("decimal_suffixes") or {}).get(str(suffix_length), [])
+    return [None if suffix is None or str(suffix) == "" else str(suffix) for suffix in suffixes]
+
+
+def _apply_design_variable_downgrade(
+    severity: str,
+    confidence: float,
+    datasets: list[dict[str, Any]],
+) -> tuple[str, float, list[str]]:
+    designed_count = sum(1 for dataset in datasets if dataset.get("is_designed_sequence_candidate"))
+    if designed_count == 0:
+        return severity, confidence, []
+
+    severity = _downgrade(severity)
+    confidence *= 0.65
+    if designed_count == len(datasets) and len(datasets) > 1:
+        severity = _downgrade(severity)
+        confidence *= 0.80
+    return severity, confidence, [
+        "表头/标签显示至少一个数据集可能是剂量、时间、编号、分组或标准曲线等设计变量，已降低置信度。"
+    ]
+
+
+def _source_pair_context(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    left_source = left.get("source") or {}
+    right_source = right.get("source") or {}
+    same_file = (left_source.get("file_path") or left_source.get("file_name")) == (
+        right_source.get("file_path") or right_source.get("file_name")
+    )
+    same_sheet = left_source.get("sheet") == right_source.get("sheet")
+    same_range = left_source.get("range") == right_source.get("range")
+    same_label = str(left.get("label", "")).strip() == str(right.get("label", "")).strip()
+    return {
+        "same_file": same_file,
+        "same_sheet": same_sheet,
+        "same_range": same_range,
+        "same_label": same_label,
+        "cross_source_reuse_candidate": not (same_file and same_sheet and same_range),
+    }
+
+
+def _pairwise_scan_stats(total_pairs: int, max_pairs: int) -> dict[str, Any]:
+    scanned = min(total_pairs, max_pairs)
+    return {
+        "pairwise_comparisons_total": total_pairs,
+        "pairwise_comparisons_scanned": scanned,
+        "pairwise_comparisons_skipped": max(total_pairs - scanned, 0),
+        "pairwise_comparison_limit_reached": total_pairs > max_pairs,
+    }
+
+
+def _positionwise_similarity(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    left_values = _clean_values(left)
+    right_values = _clean_values(right)
+    n = min(len(left_values), len(right_values))
+    left_raw = _raw_texts(left)
+    right_raw = _raw_texts(right)
+    left_suffix2 = _decimal_suffixes(left, 2)
+    right_suffix2 = _decimal_suffixes(right, 2)
+
+    equal_count = 0
+    near_equal_count = 0
+    raw_equal_count = 0
+    suffix2_equal_count = 0
+    suffix2_valid_count = 0
+    different_positions: list[dict[str, Any]] = []
+
+    for index in range(n):
+        left_value = float(left_values[index])
+        right_value = float(right_values[index])
+        scale = max(abs(left_value), abs(right_value), 1.0)
+        abs_diff = abs(left_value - right_value)
+        equal = abs_diff <= 1e-12
+        near_equal = abs_diff <= max(1e-9, 1e-6 * scale)
+        if equal:
+            equal_count += 1
+        if near_equal:
+            near_equal_count += 1
+        if index < len(left_raw) and index < len(right_raw) and left_raw[index] == right_raw[index]:
+            raw_equal_count += 1
+        if index < len(left_suffix2) and index < len(right_suffix2):
+            left_suffix = left_suffix2[index]
+            right_suffix = right_suffix2[index]
+            if left_suffix is not None and right_suffix is not None:
+                suffix2_valid_count += 1
+                if left_suffix == right_suffix:
+                    suffix2_equal_count += 1
+        if not equal and len(different_positions) < 10:
+            different_positions.append({
+                "index": index,
+                "left_value": round(left_value, 10),
+                "right_value": round(right_value, 10),
+                "left_raw": left_raw[index] if index < len(left_raw) else "",
+                "right_raw": right_raw[index] if index < len(right_raw) else "",
+            })
+
+    def ratio(count: int, denominator: int) -> float:
+        return round(count / denominator, 6) if denominator else 0.0
+
+    return {
+        "n_compared": int(n),
+        "equal_position_count": equal_count,
+        "equal_position_ratio": ratio(equal_count, n),
+        "near_equal_position_count": near_equal_count,
+        "near_equal_position_ratio": ratio(near_equal_count, n),
+        "raw_text_equal_count": raw_equal_count,
+        "raw_text_equal_ratio": ratio(raw_equal_count, n),
+        "suffix2_valid_count": suffix2_valid_count,
+        "suffix2_equal_count": suffix2_equal_count,
+        "suffix2_equal_ratio": ratio(suffix2_equal_count, suffix2_valid_count),
+        "different_position_count": int(n - equal_count),
+        "different_positions": different_positions,
+    }
+
+
 def detect_arithmetic_sequences(datasets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
     for dataset in datasets:
@@ -183,6 +331,326 @@ def detect_arithmetic_sequences(datasets: list[dict[str, Any]]) -> list[dict[str
     return evidence
 
 
+def detect_constant_numeric_datasets(datasets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for dataset in datasets:
+        values = _clean_values(dataset)
+        n = len(values)
+        if n < 5:
+            continue
+        rounded_values = [round(float(value), 10) for value in values]
+        unique_numeric = sorted(set(rounded_values))
+        raw_texts = _raw_texts(dataset)[:n]
+        non_empty_raw = [text for text in raw_texts if text != ""]
+        unique_raw = sorted(set(non_empty_raw))
+        numeric_constant = len(unique_numeric) == 1
+        raw_constant = len(non_empty_raw) == n and len(unique_raw) == 1
+        if not numeric_constant and not raw_constant:
+            continue
+
+        severity = "high" if n >= 8 and numeric_constant and raw_constant else "medium"
+        confidence = 0.88 if severity == "high" else 0.72
+        severity, confidence, design_alternatives = _apply_design_variable_downgrade(
+            severity, confidence, [dataset]
+        )
+        constant_value = unique_numeric[0] if unique_numeric else None
+        constant_raw_value = unique_raw[0] if unique_raw else None
+        evidence.append(
+            _make_evidence(
+                evidence_type="constant_numeric_series",
+                severity=severity,
+                confidence_score=confidence,
+                title="发现整行/整列数值完全一致",
+                affected_datasets=[_dataset_ref(dataset)],
+                statistics={
+                    "n": int(n),
+                    "unique_numeric_count": len(unique_numeric),
+                    "unique_raw_text_count": len(unique_raw),
+                    "constant_value": constant_value,
+                    "constant_raw_value": constant_raw_value,
+                    "numeric_constant": numeric_constant,
+                    "raw_text_constant": raw_constant,
+                    "designed_sequence_candidate": bool(dataset.get("is_designed_sequence_candidate")),
+                    "first_values": [round(float(value), 10) for value in values[:10]],
+                    "first_raw_values": raw_texts[:10],
+                },
+                deterministic_basis=(
+                    f"{dataset.get('label', '')} 中 {n} 个可分析数值"
+                    f"{'及显示文本' if raw_constant else ''}完全一致，"
+                    "提示可能存在整列/整行复制或错误填充。"
+                ),
+                alternative_explanations=design_alternatives + [
+                    "该列可能是固定实验条件、对照编码、批次编号或其他非观测型常量。"
+                ],
+                recommended_human_check=["核对该数据范围是否应为真实观测值，而非实验设计常量。"],
+            )
+        )
+    return evidence
+
+
+def detect_near_duplicate_numeric_datasets(
+    datasets: list[dict[str, Any]], max_pairs: int = MAX_POSITIONWISE_DATASET_PAIRS
+) -> tuple[list[dict[str, Any]], list[str]]:
+    evidence: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    comparable = [dataset for dataset in datasets if len(_clean_values(dataset)) >= 6]
+    total_pairs = len(comparable) * (len(comparable) - 1) // 2
+    scan_stats = _pairwise_scan_stats(total_pairs, max_pairs)
+    if total_pairs > max_pairs:
+        warnings.append(
+            f"逐行相似性 dataset 配对数为 {total_pairs}，仅比较前 {max_pairs} 对；"
+            "部分低优先级跨列/跨表近重复检测可能未覆盖。"
+        )
+
+    seen_pairs: set[tuple[str, str]] = set()
+    for pair_index, (left, right) in enumerate(combinations(comparable, 2)):
+        if pair_index >= max_pairs:
+            break
+        if _same_source_range(left, right):
+            continue
+        left_values = _clean_values(left)
+        right_values = _clean_values(right)
+        if len(left_values) != len(right_values):
+            continue
+        similarity = _positionwise_similarity(left, right)
+        n = int(similarity["n_compared"])
+        if n < 6:
+            continue
+        if similarity["equal_position_count"] == n:
+            # 完全同序复用已由 raw_numeric_similarity 的 same_order_exact 负责。
+            continue
+
+        equal_ratio = float(similarity["equal_position_ratio"])
+        near_ratio = float(similarity["near_equal_position_ratio"])
+        suffix2_ratio = float(similarity["suffix2_equal_ratio"])
+        diff_count = int(similarity["different_position_count"])
+        suffix2_valid = int(similarity["suffix2_valid_count"])
+        match_type: str | None = None
+        severity: str | None = None
+        confidence = 0.0
+
+        if n >= 8 and equal_ratio >= 0.85 and diff_count <= max(2, math.floor(n * 0.15)):
+            match_type = "positionwise_near_duplicate"
+            severity = "high"
+            confidence = 0.89
+        elif n >= 8 and near_ratio >= 0.90 and diff_count <= max(3, math.floor(n * 0.20)):
+            match_type = "positionwise_near_equal"
+            severity = "medium"
+            confidence = 0.78
+        elif n >= 8 and suffix2_valid >= max(8, math.ceil(n * 0.80)) and suffix2_ratio >= 0.85:
+            match_type = "positionwise_decimal_suffix2_reuse"
+            severity = "medium"
+            confidence = 0.74
+        elif n >= 6 and equal_ratio >= 0.83 and diff_count <= 1:
+            match_type = "small_sample_positionwise_near_duplicate"
+            severity = "medium"
+            confidence = 0.70
+
+        if match_type is None or severity is None:
+            continue
+
+        pair_key = tuple(sorted([left.get("dataset_id", ""), right.get("dataset_id", "")]))
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        severity, confidence, design_alternatives = _apply_design_variable_downgrade(
+            severity, confidence, [left, right]
+        )
+        source_context = _source_pair_context(left, right)
+        statistics = {
+            "match_type": match_type,
+            **similarity,
+            **source_context,
+            **scan_stats,
+        }
+        if match_type == "positionwise_decimal_suffix2_reuse":
+            basis = (
+                f"{left.get('label', '')} 与 {right.get('label', '')} 的小数后两位在 "
+                f"{similarity['suffix2_equal_count']}/{similarity['suffix2_valid_count']} 个可比位置一致 "
+                f"({suffix2_ratio:.1%})，提示可能复制小数部分后修改其他位数。"
+            )
+        else:
+            basis = (
+                f"{left.get('label', '')} 与 {right.get('label', '')} 在相同顺序下 "
+                f"{similarity['equal_position_count']}/{n} 个位置数值完全相同 "
+                f"({equal_ratio:.1%})，仅 {diff_count} 个位置不同。"
+            )
+        evidence.append(
+            _make_evidence(
+                evidence_type="near_duplicate_numeric_series",
+                severity=severity,
+                confidence_score=confidence,
+                title="发现两组数值逐行高度相似",
+                affected_datasets=[_dataset_ref(left), _dataset_ref(right)],
+                statistics=statistics,
+                deterministic_basis=basis,
+                alternative_explanations=design_alternatives + [
+                    "两个数据范围可能合法复用同一标准曲线、同一对照组或同一派生数据，需要结合图注和方法核对。"
+                ],
+                recommended_human_check=["核对两组数据是否声称来自相互独立的实验组、时间点或 figure/panel。"],
+            )
+        )
+    return evidence, warnings
+
+
+def _numeric_fragment_map(values: np.ndarray, window_size: int) -> dict[tuple[float, ...], list[int]]:
+    fragments: dict[tuple[float, ...], list[int]] = {}
+    if len(values) < window_size:
+        return fragments
+    for start in range(0, len(values) - window_size + 1):
+        key = tuple(round(float(value), 8) for value in values[start:start + window_size])
+        if len(set(key)) <= 1:
+            continue
+        fragments.setdefault(key, []).append(start)
+    return fragments
+
+
+def _format_fragment_values(fragment: tuple[float, ...]) -> list[float]:
+    return [round(float(value), 8) for value in fragment]
+
+
+def detect_repeated_numeric_fragments(
+    datasets: list[dict[str, Any]], max_pairs: int = MAX_FRAGMENT_DATASET_PAIRS
+) -> tuple[list[dict[str, Any]], list[str]]:
+    evidence: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    seen: set[tuple[str, str, tuple[float, ...]]] = set()
+
+    for dataset in datasets:
+        values = _clean_values(dataset)
+        n = len(values)
+        if n < 6 or len(set(round(float(value), 8) for value in values)) <= 1:
+            continue
+        emitted_for_dataset = False
+        for window_size in (5, 4, 3):
+            if n < window_size * 2:
+                continue
+            fragments = _numeric_fragment_map(values, window_size)
+            repeated = [
+                (fragment, starts) for fragment, starts in fragments.items()
+                if len(starts) >= 2
+            ]
+            if not repeated:
+                continue
+            repeated.sort(key=lambda item: (-len(item[1]), item[1][0]))
+            fragment, starts = repeated[0]
+            severity = "high" if window_size >= 4 and n >= 8 else "medium"
+            confidence = 0.84 if severity == "high" else 0.72
+            severity, confidence, design_alternatives = _apply_design_variable_downgrade(
+                severity, confidence, [dataset]
+            )
+            coverage = min(1.0, len(starts) * window_size / n)
+            evidence.append(
+                _make_evidence(
+                    evidence_type="repeated_numeric_fragment",
+                    severity=severity,
+                    confidence_score=confidence,
+                    title="发现重复数值片段",
+                    affected_datasets=[_dataset_ref(dataset)],
+                    statistics={
+                        "fragment_length": window_size,
+                        "fragment_values": _format_fragment_values(fragment),
+                        "occurrence_count": len(starts),
+                        "occurrences": [{"dataset_id": dataset.get("dataset_id", ""), "start_index": start} for start in starts[:10]],
+                        "within_dataset": True,
+                        "cross_dataset": False,
+                        "match_mode": "numeric_rounded_8dp",
+                        "coverage_ratio": round(coverage, 6),
+                    },
+                    deterministic_basis=(
+                        f"{dataset.get('label', '')} 内长度为 {window_size} 的数值片段 "
+                        f"{_format_fragment_values(fragment)} 重复出现 {len(starts)} 次。"
+                    ),
+                    alternative_explanations=design_alternatives + [
+                        "周期性实验设计、重复测量模板或派生计算可能造成短片段重复。"
+                    ],
+                    recommended_human_check=["核对这些重复片段是否来自独立样本或独立实验条件。"],
+                )
+            )
+            emitted_for_dataset = True
+            break
+        if emitted_for_dataset:
+            continue
+
+    comparable = [dataset for dataset in datasets if len(_clean_values(dataset)) >= 6]
+    total_pairs = len(comparable) * (len(comparable) - 1) // 2
+    scan_stats = _pairwise_scan_stats(total_pairs, max_pairs)
+    if total_pairs > max_pairs:
+        warnings.append(
+            f"重复片段 dataset 配对数为 {total_pairs}，仅比较前 {max_pairs} 对；"
+            "部分跨表/跨列片段复用检测可能未覆盖。"
+        )
+
+    for pair_index, (left, right) in enumerate(combinations(comparable, 2)):
+        if pair_index >= max_pairs:
+            break
+        if _same_source_range(left, right):
+            continue
+        left_values = _clean_values(left)
+        right_values = _clean_values(right)
+        min_n = min(len(left_values), len(right_values))
+        if min_n < 6:
+            continue
+        for window_size in (5, 4, 3):
+            if min_n < window_size:
+                continue
+            left_fragments = _numeric_fragment_map(left_values, window_size)
+            right_fragments = _numeric_fragment_map(right_values, window_size)
+            shared = sorted(set(left_fragments) & set(right_fragments))
+            if not shared:
+                continue
+            fragment = shared[0]
+            pair_key = tuple(sorted([left.get("dataset_id", ""), right.get("dataset_id", "")]))
+            seen_key = (pair_key[0], pair_key[1], fragment)
+            if seen_key in seen:
+                break
+            seen.add(seen_key)
+            severity = "high" if window_size >= 4 and min_n >= 8 else "medium"
+            confidence = 0.86 if severity == "high" else 0.74
+            severity, confidence, design_alternatives = _apply_design_variable_downgrade(
+                severity, confidence, [left, right]
+            )
+            statistics = {
+                "fragment_length": window_size,
+                "fragment_values": _format_fragment_values(fragment),
+                "occurrence_count": len(left_fragments[fragment]) + len(right_fragments[fragment]),
+                "occurrences": [
+                    {"dataset_id": left.get("dataset_id", ""), "start_index": start}
+                    for start in left_fragments[fragment][:5]
+                ] + [
+                    {"dataset_id": right.get("dataset_id", ""), "start_index": start}
+                    for start in right_fragments[fragment][:5]
+                ],
+                "within_dataset": False,
+                "cross_dataset": True,
+                "match_mode": "numeric_rounded_8dp",
+                "coverage_ratio": round(window_size / max(min_n, 1), 6),
+                **_source_pair_context(left, right),
+                **scan_stats,
+            }
+            evidence.append(
+                _make_evidence(
+                    evidence_type="repeated_numeric_fragment",
+                    severity=severity,
+                    confidence_score=confidence,
+                    title="发现跨数据集重复数值片段",
+                    affected_datasets=[_dataset_ref(left), _dataset_ref(right)],
+                    statistics=statistics,
+                    deterministic_basis=(
+                        f"{left.get('label', '')} 与 {right.get('label', '')} 共享长度为 "
+                        f"{window_size} 的数值片段 {_format_fragment_values(fragment)}，"
+                        "提示可能存在局部序列复用。"
+                    ),
+                    alternative_explanations=design_alternatives + [
+                        "两个表格可能合法引用同一对照、标准曲线或派生计算结果，需要人工核对。"
+                    ],
+                    recommended_human_check=["核对共享片段是否跨不同 figure、panel、实验条件或独立重复出现。"],
+                )
+            )
+            break
+    return evidence, warnings
+
+
 def _rounded_counter(values: np.ndarray, decimals: int = 10) -> Counter:
     return Counter(round(float(v), decimals) for v in values)
 
@@ -214,7 +682,11 @@ def detect_numeric_similarity(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     evidence: list[dict[str, Any]] = []
     warnings: list[str] = []
-    comparable = [d for d in datasets if len(_clean_values(d)) >= 5]
+    comparable = []
+    for dataset in datasets:
+        values = _clean_values(dataset)
+        if len(values) >= 5 and not _is_low_information_numeric_series(values):
+            comparable.append(dataset)
     total_pairs = len(comparable) * (len(comparable) - 1) // 2
     if total_pairs > max_pairs:
         warnings.append(
@@ -479,6 +951,14 @@ def detect_last_digit_anomalies(datasets: list[dict[str, Any]]) -> list[dict[str
         counts = Counter(digits)
         observed = [counts.get(d, 0) for d in range(10)]
         expected = n / 10
+        dominant_digit, dominant_count = max(enumerate(observed), key=lambda item: item[1])
+        missing_digits = [str(digit) for digit, count in enumerate(observed) if count == 0]
+        digit_summary = {
+            "dominant_digit": str(dominant_digit),
+            "dominant_digit_count": dominant_count,
+            "dominant_digit_frequency": round(dominant_count / n, 6),
+            "missing_digits": missing_digits,
+        }
 
         for digit, count in enumerate(observed):
             if count >= max(math.ceil(expected * 2), math.ceil(expected + 5)):
@@ -502,6 +982,7 @@ def detect_last_digit_anomalies(datasets: list[dict[str, Any]]) -> list[dict[str
                                 "p_value": p_value,
                                 "fdr_hypothesis_count": 21,
                                 "digit_counts": {str(d): observed[d] for d in range(10)},
+                                **digit_summary,
                             },
                             deterministic_basis=(
                                 f"{dataset.get('label', '')} 中 {n} 个可分析小数末位里，数字 {digit} "
@@ -534,6 +1015,7 @@ def detect_last_digit_anomalies(datasets: list[dict[str, Any]]) -> list[dict[str
                                 "fdr_hypothesis_count": 21,
                                 "any_digit_missing_probability": _prob_any_digit_missing(n),
                                 "digit_counts": {str(d): observed[d] for d in range(10)},
+                                **digit_summary,
                             },
                             deterministic_basis=(
                                 f"{dataset.get('label', '')} 中 {n} 个可分析小数末位里，数字 {digit} "
@@ -562,6 +1044,7 @@ def detect_last_digit_anomalies(datasets: list[dict[str, Any]]) -> list[dict[str
                         "p_value": float(chi_p),
                         "fdr_hypothesis_count": 21,
                         "digit_counts": {str(d): observed[d] for d in range(10)},
+                        **digit_summary,
                     },
                     deterministic_basis=(
                         f"{dataset.get('label', '')} 的小数末位 0-9 整体分布偏离均匀分布，"
@@ -736,7 +1219,14 @@ def run_raw_data_precheck(
     warnings: list[str] = []
     evidence: list[dict[str, Any]] = []
 
+    evidence.extend(detect_constant_numeric_datasets(datasets))
     evidence.extend(detect_arithmetic_sequences(datasets))
+    near_evidence, near_warnings = detect_near_duplicate_numeric_datasets(datasets)
+    evidence.extend(near_evidence)
+    warnings.extend(near_warnings)
+    fragment_evidence, fragment_warnings = detect_repeated_numeric_fragments(datasets)
+    evidence.extend(fragment_evidence)
+    warnings.extend(fragment_warnings)
     numeric_evidence, numeric_warnings = detect_numeric_similarity(datasets)
     evidence.extend(numeric_evidence)
     warnings.extend(numeric_warnings)

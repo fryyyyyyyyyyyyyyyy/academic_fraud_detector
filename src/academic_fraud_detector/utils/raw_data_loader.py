@@ -22,6 +22,8 @@ MAX_ROW_DATASET_CANDIDATES_PER_SHEET = 500
 DESIGNED_KEYWORDS = (
     "id",
     "no",
+    "number",
+    "index",
     "编号",
     "序号",
     "sample no",
@@ -30,11 +32,28 @@ DESIGNED_KEYWORDS = (
     "时间",
     "day",
     "week",
+    "month",
+    "月份",
     "dose",
     "dosage",
     "concentration",
+    "conc",
     "浓度",
     "剂量",
+    "group",
+    "组别",
+    "分组",
+    "treatment",
+    "处理",
+    "control",
+    "对照",
+    "standard",
+    "标准",
+    "calibrator",
+    "batch",
+    "批次",
+    "replicate",
+    "重复",
     "年龄",
     "age",
 )
@@ -214,6 +233,106 @@ def _cell_record(cell: Any) -> dict[str, Any] | None:
     }
 
 
+def _looks_like_table_title(text: str) -> bool:
+    return bool(re.search(r"\b(?:fig(?:ure)?|table)\s*[.\-]?\s*\d*", text, re.IGNORECASE))
+
+
+def _record_bounds(records: list[dict[str, Any]]) -> tuple[int, int, int, int]:
+    rows = [int(r["row"]) for r in records]
+    cols = [int(r["column"]) for r in records]
+    return min(rows), min(cols), max(rows), max(cols)
+
+
+def _range_from_bounds(min_row: int, min_col: int, max_row: int, max_col: int) -> str:
+    first = f"{get_column_letter(min_col)}{min_row}"
+    last = f"{get_column_letter(max_col)}{max_row}"
+    return first if first == last else f"{first}:{last}"
+
+
+def _has_table_title_between_records(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    axis: str,
+    text_by_cell: dict[tuple[int, int], str],
+) -> bool:
+    if axis == "row":
+        row_start = int(previous["row"]) + 1
+        row_end = int(current["row"]) - 1
+        fixed_col = int(current["column"])
+        col_start = max(1, fixed_col - 6)
+        col_end = fixed_col + 6
+        cells = (
+            text_by_cell.get((row, col), "")
+            for row in range(row_start, row_end + 1)
+            for col in range(col_start, col_end + 1)
+        )
+    else:
+        col_start = int(previous["column"]) + 1
+        col_end = int(current["column"]) - 1
+        fixed_row = int(current["row"])
+        row_start = max(1, fixed_row - 5)
+        row_end = fixed_row
+        cells = (
+            text_by_cell.get((row, col), "")
+            for row in range(row_start, row_end + 1)
+            for col in range(col_start, col_end + 1)
+        )
+    return any(_looks_like_table_title(text) for text in cells if text)
+
+
+def _split_records_by_gap(
+    records: list[dict[str, Any]],
+    *,
+    axis: str,
+    text_by_cell: dict[tuple[int, int], str],
+    max_internal_gap: int = 2,
+) -> list[list[dict[str, Any]]]:
+    if not records:
+        return []
+    axis_key = "row" if axis == "row" else "column"
+    sorted_records = sorted(records, key=lambda item: int(item[axis_key]))
+    segments: list[list[dict[str, Any]]] = [[sorted_records[0]]]
+    for previous, current in zip(sorted_records, sorted_records[1:]):
+        gap = int(current[axis_key]) - int(previous[axis_key]) - 1
+        title_between = gap > 0 and _has_table_title_between_records(
+            previous,
+            current,
+            axis=axis,
+            text_by_cell=text_by_cell,
+        )
+        if gap > max_internal_gap or title_between:
+            segments.append([])
+        segments[-1].append(current)
+    return segments
+
+
+def _nearby_table_title(
+    text_by_cell: dict[tuple[int, int], str],
+    *,
+    min_row: int,
+    min_col: int,
+    max_col: int,
+) -> str:
+    row_start = max(1, min_row - 5)
+    row_end = max(0, min_row - 1)
+    col_start = max(1, min_col - 6)
+    col_end = max_col + 6
+    candidates: list[tuple[int, int, str]] = []
+    for row in range(row_start, row_end + 1):
+        for col in range(col_start, col_end + 1):
+            text = text_by_cell.get((row, col))
+            if not text or not _looks_like_table_title(text):
+                continue
+            row_distance = min_row - row
+            col_distance = min(abs(col - min_col), abs(col - max_col))
+            candidates.append((row_distance, col_distance, text))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][2]
+
+
 def _build_dataset(
     *,
     file_path: Path,
@@ -224,6 +343,9 @@ def _build_dataset(
     row_labels: list[str],
     column_labels: list[str],
     header: str,
+    table_id: str | None = None,
+    table_range: str | None = None,
+    table_title: str | None = None,
 ) -> dict[str, Any] | None:
     if len(records) < 3:
         return None
@@ -257,6 +379,9 @@ def _build_dataset(
             "range": cell_range,
             "analyzed_cells": analyzed_cells,
             "header": header,
+            "table_id": table_id or "",
+            "table_range": table_range or cell_range,
+            "table_title": table_title or "",
         },
         "label": label,
         "row_labels": row_labels,
@@ -355,45 +480,69 @@ def _datasets_from_sheet(file_path: Path, sheet: Any, min_values: int) -> list[d
         return f"Column {get_column_letter(col)}"
 
     for col, records in sorted(numeric_by_col.items()):
-        if len(records) < min_values:
-            continue
-        first_row = records[0]["row"]
-        header = nearby_column_header(first_row, col)
-        col_letter = get_column_letter(col)
-        label = f"{file_path.name}/{sheet_name}/{col_letter} {header}"
-        row_labels = [row_label(r["row"], col) for r in records]
-        dataset = _build_dataset(
-            file_path=file_path,
-            sheet_name=sheet_name,
-            orientation="column",
-            label=label,
-            records=records,
-            row_labels=row_labels,
-            column_labels=[header],
-            header=header,
-        )
-        if dataset is not None:
-            datasets.append(dataset)
+        for segment in _split_records_by_gap(records, axis="row", text_by_cell=text_by_cell):
+            if len(segment) < min_values:
+                continue
+            first_row = segment[0]["row"]
+            header = nearby_column_header(first_row, col)
+            col_letter = get_column_letter(col)
+            label = f"{file_path.name}/{sheet_name}/{col_letter} {header}"
+            row_labels = [row_label(r["row"], col) for r in segment]
+            min_row, min_col, max_row, max_col = _record_bounds(segment)
+            table_range = _range_from_bounds(min_row, min_col, max_row, max_col)
+            table_title = _nearby_table_title(
+                text_by_cell,
+                min_row=min_row,
+                min_col=min_col,
+                max_col=max_col,
+            )
+            dataset = _build_dataset(
+                file_path=file_path,
+                sheet_name=sheet_name,
+                orientation="column",
+                label=label,
+                records=segment,
+                row_labels=row_labels,
+                column_labels=[header],
+                header=header,
+                table_id=f"{file_path.name}::{sheet_name}::{table_range}",
+                table_range=table_range,
+                table_title=table_title,
+            )
+            if dataset is not None:
+                datasets.append(dataset)
 
     for row, records in sorted(numeric_by_row.items()):
-        if len(records) < min_values:
-            continue
-        first_col = records[0]["column"]
-        header = nearby_row_header(row, first_col)
-        label = f"{file_path.name}/{sheet_name}/Row {row} {header}"
-        column_labels = [col_label(row, r["column"]) for r in records]
-        dataset = _build_dataset(
-            file_path=file_path,
-            sheet_name=sheet_name,
-            orientation="row",
-            label=label,
-            records=records,
-            row_labels=[header],
-            column_labels=column_labels,
-            header=header,
-        )
-        if dataset is not None:
-            datasets.append(dataset)
+        for segment in _split_records_by_gap(records, axis="column", text_by_cell=text_by_cell):
+            if len(segment) < min_values:
+                continue
+            first_col = segment[0]["column"]
+            header = nearby_row_header(row, first_col)
+            label = f"{file_path.name}/{sheet_name}/Row {row} {header}"
+            column_labels = [col_label(row, r["column"]) for r in segment]
+            min_row, min_col, max_row, max_col = _record_bounds(segment)
+            table_range = _range_from_bounds(min_row, min_col, max_row, max_col)
+            table_title = _nearby_table_title(
+                text_by_cell,
+                min_row=min_row,
+                min_col=min_col,
+                max_col=max_col,
+            )
+            dataset = _build_dataset(
+                file_path=file_path,
+                sheet_name=sheet_name,
+                orientation="row",
+                label=label,
+                records=segment,
+                row_labels=[header],
+                column_labels=column_labels,
+                header=header,
+                table_id=f"{file_path.name}::{sheet_name}::{table_range}",
+                table_range=table_range,
+                table_title=table_title,
+            )
+            if dataset is not None:
+                datasets.append(dataset)
 
     return datasets
 
