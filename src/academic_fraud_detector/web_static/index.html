@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Academic Fraud Detector WebUI</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar__inner">
+        <div>
+          <p class="brand-kicker">Academic Fraud Detector</p>
+          <h1>学术诚信调查工作台</h1>
+        </div>
+        <div class="service-chip" aria-label="服务状态">
+          <span class="service-chip__mark" aria-hidden="true"></span>
+          本地运行
+        </div>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="intro-grid" aria-labelledby="pageTitle">
+        <div class="input-panel panel">
+          <p class="section-label">调查对象</p>
+          <h2 id="pageTitle">提交论文或案例目录</h2>
+          <p class="panel-copy">
+            提交论文标识、本机 PDF 或包含原始数据的案例目录，调用现有调查流程生成可审阅报告。
+          </p>
+
+          <form id="jobForm" class="job-form">
+            <fieldset class="mode-group">
+              <legend>选择输入类型</legend>
+              <label><input type="radio" name="identifier_type" value="doi" checked /> DOI</label>
+              <label><input type="radio" name="identifier_type" value="arxiv_id" /> arXiv</label>
+              <label><input type="radio" name="identifier_type" value="title" /> 论文标题</label>
+              <label><input type="radio" name="identifier_type" value="url" /> URL</label>
+              <label><input type="radio" name="identifier_type" value="local_pdf" /> 本机 PDF</label>
+              <label><input type="radio" name="identifier_type" value="local_case" /> 案例目录</label>
+            </fieldset>
+
+            <div class="field-block">
+              <label id="identifierLabel" for="paperIdentifier">DOI</label>
+              <input
+                id="paperIdentifier"
+                name="paper_identifier"
+                type="text"
+                autocomplete="off"
+                placeholder="例如 10.1038/example"
+                required
+              />
+              <p id="identifierHelp" class="helper-text">输入论文 DOI，系统会使用现有调查流程处理。</p>
+            </div>
+
+            <div class="field-block">
+              <label for="outputDir">输出目录，可选</label>
+              <input
+                id="outputDir"
+                name="output_dir"
+                type="text"
+                autocomplete="off"
+                placeholder="留空时使用 reports/webui/<job_id>"
+              />
+              <p class="helper-text">路径位于运行 WebUI 的这台机器上。</p>
+            </div>
+
+            <div class="form-actions">
+              <button id="submitButton" class="button button-primary" type="submit">开始调查</button>
+              <button id="resetButton" class="button button-secondary" type="button">清空</button>
+            </div>
+          </form>
+        </div>
+
+        <aside class="scope-panel panel" aria-labelledby="scopeTitle">
+          <p class="section-label">覆盖范围</p>
+          <h2 id="scopeTitle">能力边界保持透明</h2>
+          <div class="scope-list">
+            <article>
+              <h3>案例目录</h3>
+              <p>需包含至少一个 PDF 和至少一个 .xlsx、.xlsm、.xltx 或 .xltm 原始数据文件。</p>
+            </article>
+            <article>
+              <h3>本地模式</h3>
+              <p>重点审计数据完整性与方法一致性。未执行的维度不会在界面中承诺。</p>
+            </article>
+            <article>
+              <h3>输出文件</h3>
+              <p>每次调查生成 Markdown、HTML 与 JSON 备份，便于审阅、归档和复核。</p>
+            </article>
+          </div>
+        </aside>
+      </section>
+
+      <section id="statusPanel" class="status-panel panel" data-state="idle" aria-live="polite">
+        <div class="status-panel__header">
+          <div>
+            <p class="section-label">任务状态</p>
+            <h2 id="statusTitle">尚未开始调查</h2>
+          </div>
+          <span id="statusBadge" class="status-badge">idle</span>
+        </div>
+        <div id="loadingBar" class="loading-bar" hidden><span></span></div>
+        <p id="statusMessage" class="panel-copy">
+          选择 DOI、论文标题、本机 PDF 或案例目录后启动。报告会保存为 JSON、Markdown 和 HTML。
+        </p>
+        <div id="statusMeta" class="status-meta" hidden></div>
+      </section>
+
+      <section id="resultPanel" class="result-panel panel" hidden>
+        <div class="result-panel__top">
+          <div>
+            <p class="section-label">审计结果</p>
+            <h2 id="resultTitle">调查完成</h2>
+          </div>
+          <div id="riskSummary" class="risk-summary" hidden></div>
+        </div>
+
+        <div id="fileLinks" class="file-links" aria-label="报告文件"></div>
+
+        <div class="preview-block">
+          <div class="preview-block__header">
+            <h3>Markdown 预览</h3>
+            <p>仅展示前部内容，完整报告请打开文件。</p>
+          </div>
+          <pre id="markdownPreview"></pre>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

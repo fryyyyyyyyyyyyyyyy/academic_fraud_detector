@@ -285,9 +285,10 @@ def save_report_files(
     markdown_text: str,
     output_dir: Path,
     base_name: str,
+    open_browser: bool = True,
 ) -> dict:
     """
-    Save the report as .md and .html, then open HTML in browser.
+    Save the report as .md and .html.
 
     Returns a dict with paths:
         {"md": Path, "html": Path}
@@ -309,13 +310,14 @@ def save_report_files(
     results["html"] = html_path
     logger.info(f"[HTML] HTML 报告已保存: {html_path}")
 
-    # 3. Auto-open HTML in browser
-    try:
-        import webbrowser
-        webbrowser.open(str(html_path))
-        logger.info("[HTML] 已在浏览器中打开报告。")
-    except Exception:
-        pass
+    # 3. Auto-open HTML in browser for CLI usage.
+    if open_browser:
+        try:
+            import webbrowser
+            webbrowser.open(str(html_path))
+            logger.info("[HTML] 已在浏览器中打开报告。")
+        except Exception:
+            pass
 
     return results
 
@@ -324,16 +326,18 @@ def run_investigation(
     paper_identifier: str,
     identifier_type: str = "doi",
     output_dir: Optional[str] = None,
+    open_browser: bool = True,
 ) -> dict:
     """
     Run a full academic fraud investigation on a target paper.
 
-    Produces 3 report formats: .md (Markdown), .html (styled HTML), .pdf (PDF).
+    Produces report files: .md (Markdown), .html (styled HTML), and .json (raw backup).
 
     Args:
         paper_identifier: DOI, arXiv ID, title, URL, local PDF path, or local case folder.
         identifier_type: One of 'doi', 'arxiv_id', 'title', 'url', 'local_pdf', 'local_case'.
-        output_dir: Directory for output files. Defaults to ./reports/
+        output_dir: Directory for output files. Defaults to ./reports/.
+        open_browser: Whether to open the generated HTML report in a browser.
 
     Returns:
         Dict with keys: "markdown" (str), "files" (dict of paths), "elapsed" (float).
@@ -378,7 +382,13 @@ def run_investigation(
         json.dump({"raw_markdown": markdown_text}, f, indent=2, ensure_ascii=False)
     logger.info(f"[JSON] Raw output backup saved to: {json_path}")
 
-    files = save_report_files(markdown_text, output_path, base_name)
+    files = save_report_files(
+        markdown_text,
+        output_path,
+        base_name,
+        open_browser=open_browser,
+    )
+    files["json"] = json_path
 
     # ── Print terminal summary ──
     title = _extract_title_from_markdown(markdown_text) or paper_identifier
@@ -396,7 +406,8 @@ def run_investigation(
     print(f"  耗时       : {elapsed:.1f} 秒")
     print("-" * 70)
     print(f"  Markdown   : {files['md']}")
-    print(f"  HTML       : {files['html']}  (已在浏览器中打开)")
+    print(f"  HTML       : {files['html']}" + ("  (已在浏览器中打开)" if open_browser else ""))
+    print(f"  JSON       : {files['json']}")
     print("=" * 70 + "\n")
 
     # Print executive summary
@@ -442,7 +453,7 @@ def main():
         print("\n输出文件：")
         print("  .md   — 中文 Markdown 报告（主格式，可直接阅读）")
         print("  .html — 带样式的 HTML 报告（可在浏览器中打开并打印为 PDF）")
-        print("  .pdf  — PDF 报告（需安装 weasyprint）")
+        print("  .json — 原始输出备份")
         sys.exit(1)
 
     # Handle local shorthand flags.
