@@ -369,6 +369,14 @@ data_integrity_investigation:
 
     {raw_data_precheck_json}
 
+    #### 论文 claim anchor（代码确定性抽取，供回到论文语境定位）
+
+    {paper_claims_json}
+
+    #### 论文统计值 ↔ XLSX 候选对齐 seed
+
+    {evidence_cross_validation_json}
+
     #### 可报告结论白名单（allowed_claims）
 
     {allowed_claims_json}
@@ -382,6 +390,8 @@ data_integrity_investigation:
     - 如果没有 high/critical 证据，必须明确写“未发现高置信度确定性数据造假证据”。
     - 如果 raw_data_files_json 为空，说明当前是 PDF-only 本地模式，不能声称完成 XLSX 原始数据审计。
     - 统计异常不等于单独证明造假；必须列出可能的非造假解释和人工复核建议。
+    - paper_claims_json 只是论文原文定位锚点，不是风险证据；只能用于说明 evidence_id 可能对应的论文位置。
+    - evidence_cross_validation_json 是确定性候选 seed；ambiguous/no_candidate/unverifiable 只能写为人工复核或局限性。
 
     ### 必须覆盖的证据类型
 
@@ -425,6 +435,89 @@ data_integrity_investigation:
       "limitations": ["本次不做图片处理", "末位均匀假设限制", "Excel显示精度限制"],
       "category_risk_score": 0-100,
       "basis_rule": "所有结论均来自 evidence_id；未列入 allowed_claims 的指控不得报告。"
+    }
+  agent: data_integrity_auditor
+  context: [acquire_target_paper]
+
+evidence_cross_validation:
+  description: >
+    ## 任务：证据语境交叉验证（LLM 回到论文中定位、解释、反证和串联）
+
+    你要基于代码层已经产生的客观异常，把每条重要 evidence_id 放回论文正文、表格、图注和方法语境中审查。
+    你的职责不是重新计算统计异常，也不是创造新的造假指控；你的职责是：定位、解释、反证、串联。
+
+    ### 输入
+
+    #### 论文全文/Markdown
+
+    {local_paper_text}
+
+    #### 论文 claim anchor（代码确定性抽取）
+
+    {paper_claims_json}
+
+    #### 原始数据确定性预检 JSON
+
+    {raw_data_precheck_json}
+
+    #### 确定性 evidence_id 列表
+
+    {deterministic_evidence_json}
+
+    #### 论文统计值 ↔ XLSX 候选对齐 seed
+
+    {evidence_cross_validation_json}
+
+    #### 可报告结论白名单
+
+    {allowed_claims_json}
+
+    ### 你的工作方式
+
+    1. **定位**：对 high/critical/medium 的 evidence_id，优先从 paper_claims_json 中找可能对应的 Results、Table、Figure caption、Methods 位置；必要时在 local_paper_text 中引用短原文片段。
+    2. **解释**：说明如果该异常确实对应论文核心结果，它如何增强或削弱风险判断。
+    3. **反证**：主动寻找合理非造假解释，包括剂量梯度、时间点、编号、标准曲线、仪器固定精度、归一化、fold change、共享对照组或模板表格。
+    4. **串联**：把数据异常与 n 值、组别、统计方法、Methods 描述、表格/图注联系起来。
+    5. **分级处理**：每条 evidence_id 给出 contextual_verdict：keep / downgrade / human_review_only / not_linked_to_paper。
+
+    ### 硬性边界
+
+    - 你不能新增 raw_data_precheck_json 中不存在的客观统计异常。
+    - 没有 evidence_id 的内容不能作为主要风险发现。
+    - paper_claims_json 中的 claim 只是定位锚点，不是造假证据。
+    - 如果 evidence_id 只能对应 ambiguous/no_candidate/unverifiable 的候选链路，默认应降级为 human_review_only，除非论文语境提供强支持。
+    - 所有 LLM 知识性判断必须标注“需人工验证”。
+    - 当前本地模式不做图像取证、图像 OCR、外部数据库检索或引用网络调查。
+
+    ### 目标案例
+    {paper_identifier}
+  expected_output: >
+    JSON 格式报告（所有文本字段必须使用中文）：
+
+    {
+      "category": "evidence_cross_validation",
+      "summary": "2-5句中文总结，说明哪些 evidence_id 被论文语境支持、哪些被反证或降级",
+      "reviews": [
+        {
+          "evidence_id": "E-0001",
+          "linked_claim_ids": ["PCL-0004"],
+          "paper_locations": [
+            {"page": 3, "section": "Results", "excerpt": "论文原文短片段"}
+          ],
+          "xlsx_locations": [
+            {"file_name": "...", "sheet": "...", "range": "..."}
+          ],
+          "contextual_verdict": "keep|downgrade|human_review_only|not_linked_to_paper",
+          "supports_concern": true,
+          "refutation_notes": ["可能的非造假解释或反证"],
+          "reasoning": "解释为什么保留/降级/仅人工复核",
+          "reporting_instruction": "可作为主要证据|仅作为人工复核|不要写成风险发现"
+        }
+      ],
+      "cross_dimension_links": [
+        {"evidence_id": "E-0001", "methodology_issue": "n值不一致", "detail": "..."}
+      ],
+      "limitations": ["无法从论文中定位的 evidence_id 应列出原因"]
     }
   agent: data_integrity_auditor
   context: [acquire_target_paper]
@@ -1084,6 +1177,8 @@ local_synthesize_findings:
     - XLSX 数据概况：{raw_data_profile_json}
     - 原始数据预检摘要：{raw_data_precheck}
     - 原始数据预检 JSON：{raw_data_precheck_json}
+    - 论文 claim anchor：{paper_claims_json}
+    - 论文-XLSX 交叉验证 seed：{evidence_cross_validation_json}
     - 确定性证据 JSON：{deterministic_evidence_json}
     - 置信度摘要：{confidence_summary_json}
     - 可报告结论白名单：{allowed_claims_json}
@@ -1098,6 +1193,8 @@ local_synthesize_findings:
     6. 若 raw_data_files_json 为空，应标注为 PDF-only 本地模式，不能声称完成 XLSX 原始数据审计。
     7. 对末位数字异常必须写出概率模型和 p_value/q_value；对近似等差必须写出 diff_cv/R²；
        对重复/相似必须写出匹配类型和具体文件/sheet/range。
+    8. 必须结合 evidence_cross_validation 任务输出：contextual_verdict=downgrade/human_review_only/not_linked_to_paper
+       的 evidence_id 不得写成高置信主结论，只能写入需人工复核或局限性。
 
     ### 目标案例
     {paper_identifier}
@@ -1191,7 +1288,15 @@ local_synthesize_findings:
     必须说明 binomial 或 chi-square 概率。对“某数字缺失”同时说明指定数字缺失概率和任一数字缺失概率。
 
     ### 5.5 论文内容与原始数据对齐
-    基于 paper_raw_data_alignment 写摘要；如果没有明确映射，说明不能把未匹配直接当作造假证据。
+    基于 paper_raw_data_alignment 和 evidence_cross_validation 写摘要；如果没有明确映射，说明不能把未匹配直接当作造假证据。
+
+    ### 5.6 论文语境交叉验证证据链
+
+    | Evidence ID | Claim ID | 论文位置/原文片段 | XLSX 位置 | LLM 语境结论 | 反证/降级理由 | 最终处理 |
+    |-------------|----------|------------------|-----------|--------------|----------------|----------|
+    | E-0001 | PCL-0004 | page/section/excerpt | file/sheet/range | keep/downgrade/... | ... | 采纳/降级/人工复核 |
+
+    该表必须来自 evidence_cross_validation 任务输出。没有 evidence_id 的 claim 不得写成主要风险发现。
 
     ---
 
@@ -1234,4 +1339,5 @@ local_synthesize_findings:
   context:
     - acquire_target_paper
     - data_integrity_investigation
+    - evidence_cross_validation
     - methodology_audit

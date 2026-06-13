@@ -1057,12 +1057,57 @@ def detect_last_digit_anomalies(datasets: list[dict[str, Any]]) -> list[dict[str
     return evidence
 
 
+def _reported_mean_sd_items(paper_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """从 paper_claims 或旧 pre_extracted_stats 中提取可对齐的 mean±SD。"""
+    claims = ((paper_payload.get("paper_claims") or {}).get("claims") or [])
+    reported: list[dict[str, Any]] = []
+    for claim in claims:
+        if claim.get("claim_type") != "reported_mean_sd":
+            continue
+        values = claim.get("values") or {}
+        try:
+            mean = float(values.get("mean"))
+            sd = float(values.get("sd"))
+        except (TypeError, ValueError):
+            continue
+        reported.append({
+            "claim_id": claim.get("claim_id"),
+            "mean": mean,
+            "sd": sd,
+            "raw_text": claim.get("raw_text", ""),
+            "context": claim.get("normalized_text") or claim.get("raw_text", ""),
+            "source": claim.get("source"),
+            "source_kind": "paper_claims",
+        })
+
+    if reported:
+        return reported
+
+    extracted = (paper_payload.get("pre_extracted_stats") or {}).get("means_and_sds") or []
+    for index, item in enumerate(extracted[:200], start=1):
+        try:
+            mean = float(item.get("mean"))
+            sd = float(item.get("sd"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        reported.append({
+            "claim_id": item.get("claim_id") or f"STAT-{index:04d}",
+            "mean": mean,
+            "sd": sd,
+            "raw_text": item.get("raw_text", ""),
+            "context": item.get("context", ""),
+            "source": item.get("source"),
+            "source_kind": "pre_extracted_stats",
+        })
+    return reported
+
+
 def compare_paper_stats_to_raw_data(
     paper_payload: dict[str, Any] | None, datasets: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """给出论文提取统计量与原始数据描述统计的候选对齐结果。"""
     paper_payload = paper_payload or {}
-    extracted = (paper_payload.get("pre_extracted_stats") or {}).get("means_and_sds") or []
+    reported_items = _reported_mean_sd_items(paper_payload)
     dataset_stats = []
     for dataset in datasets:
         values = _clean_values(dataset)
@@ -1076,11 +1121,19 @@ def compare_paper_stats_to_raw_data(
         })
 
     alignments = []
-    for item in extracted[:200]:
+    for item in reported_items[:200]:
         try:
             reported_mean = float(item.get("mean"))
             reported_sd = float(item.get("sd"))
         except (TypeError, ValueError, AttributeError):
+            alignments.append({
+                "claim_id": item.get("claim_id"),
+                "reported": item,
+                "reported_source": item.get("source"),
+                "candidate_match_count": 0,
+                "candidate_matches": [],
+                "verdict": "unverifiable",
+            })
             continue
         candidates = []
         for ds_stat in dataset_stats:
@@ -1088,29 +1141,147 @@ def compare_paper_stats_to_raw_data(
             sd_diff = abs(ds_stat["sd"] - reported_sd)
             mean_scale = max(abs(reported_mean), abs(ds_stat["mean"]), 1.0)
             sd_scale = max(abs(reported_sd), abs(ds_stat["sd"]), 1.0)
-            if mean_diff / mean_scale <= 0.02 and sd_diff / sd_scale <= 0.05:
+            mean_rel = mean_diff / mean_scale
+            sd_rel = sd_diff / sd_scale
+            if mean_rel <= 0.02 and sd_rel <= 0.05:
                 candidates.append({
                     "dataset": ds_stat["dataset"],
                     "n": ds_stat["n"],
                     "computed_mean": round(ds_stat["mean"], 8),
                     "computed_sd": round(ds_stat["sd"], 8),
-                    "mean_relative_diff": round(mean_diff / mean_scale, 8),
-                    "sd_relative_diff": round(sd_diff / sd_scale, 8),
+                    "mean_relative_diff": round(mean_rel, 8),
+                    "sd_relative_diff": round(sd_rel, 8),
+                    "match_quality": "strong" if mean_rel <= 0.01 and sd_rel <= 0.03 else "weak",
                 })
+        if len(candidates) == 1:
+            verdict = "matched"
+        elif len(candidates) > 1:
+            verdict = "ambiguous"
+        else:
+            verdict = "no_candidate"
         alignments.append({
+            "claim_id": item.get("claim_id"),
             "reported": item,
+            "reported_source": item.get("source"),
             "candidate_match_count": len(candidates),
             "candidate_matches": candidates[:5],
+            "verdict": verdict,
         })
 
+    counts = Counter(item.get("verdict", "unverifiable") for item in alignments)
+    omitted = max(0, len(alignments) - 200)
     return {
-        "reported_mean_sd_count": len(extracted),
+        "reported_mean_sd_count": len(reported_items),
         "raw_dataset_stats_count": len(dataset_stats),
+        "counts": {
+            "matched": counts.get("matched", 0),
+            "ambiguous": counts.get("ambiguous", 0),
+            "no_candidate": counts.get("no_candidate", 0),
+            "unverifiable": counts.get("unverifiable", 0),
+        },
+        "alignments": alignments[:200],
+        "alignment_count": len(alignments),
+        "alignment_omitted_count": omitted,
         "alignments_sample": alignments[:50],
+        "unmatched_reported_stats": [
+            item for item in alignments if item.get("verdict") == "no_candidate"
+        ][:20],
+        "ambiguous_matches": [
+            item for item in alignments if item.get("verdict") == "ambiguous"
+        ][:20],
         "note": (
             "该对齐结果仅用于辅助定位论文报告统计量与 XLSX 数据集的可能对应关系；"
             "没有明确标签映射时，不把未匹配项直接作为造假证据。"
         ),
+        "limitations": [
+            "mean±SD 近似匹配只是候选召回，不代表论文结果与 XLSX 数据已经建立唯一映射。",
+            "ambiguous/no_candidate/unverifiable 只能进入人工复核或局限性，不能单独作为造假证据。",
+        ],
+    }
+
+
+def build_evidence_cross_validation_seed(
+    alignment: dict[str, Any], findings: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """构建供 LLM 交叉验证任务使用的确定性候选链路。"""
+    dataset_to_evidence: dict[str, list[str]] = {}
+    for item in findings:
+        evidence_id = item.get("evidence_id")
+        if not evidence_id:
+            continue
+        for dataset in item.get("affected_datasets", []):
+            dataset_id = dataset.get("dataset_id")
+            if dataset_id:
+                dataset_to_evidence.setdefault(dataset_id, []).append(evidence_id)
+
+    validations = []
+    for index, item in enumerate(alignment.get("alignments", []), start=1):
+        candidates = item.get("candidate_matches", [])
+        linked_ids: list[str] = []
+        for candidate in candidates:
+            dataset_id = (candidate.get("dataset") or {}).get("dataset_id")
+            linked_ids.extend(dataset_to_evidence.get(dataset_id, []))
+        linked_ids = sorted(set(linked_ids))
+        raw_source = None
+        metrics = {
+            "reported_mean": (item.get("reported") or {}).get("mean"),
+            "reported_sd": (item.get("reported") or {}).get("sd"),
+            "computed_mean": None,
+            "computed_sd": None,
+            "mean_relative_diff": None,
+            "sd_relative_diff": None,
+        }
+        if len(candidates) == 1:
+            candidate = candidates[0]
+            raw_source = (candidate.get("dataset") or {}).get("source_location")
+            metrics.update({
+                "computed_mean": candidate.get("computed_mean"),
+                "computed_sd": candidate.get("computed_sd"),
+                "mean_relative_diff": candidate.get("mean_relative_diff"),
+                "sd_relative_diff": candidate.get("sd_relative_diff"),
+            })
+        verdict = item.get("verdict", "unverifiable")
+        if verdict == "matched":
+            basis = "论文报告统计量存在一个 XLSX 描述统计候选匹配；需由 LLM 回到论文语境判断是否对应核心结果。"
+        elif verdict == "ambiguous":
+            basis = "论文报告统计量存在多个 XLSX 候选匹配，不能建立唯一映射。"
+        elif verdict == "no_candidate":
+            basis = "未找到与论文报告统计量近似匹配的 XLSX 数据集；没有明确映射时不能单独作为造假证据。"
+        else:
+            basis = "该论文报告统计量无法完成确定性对齐。"
+        validations.append({
+            "validation_id": f"XVAL-{index:04d}",
+            "claim_id": item.get("claim_id"),
+            "reported_source": item.get("reported_source"),
+            "raw_source": raw_source,
+            "candidate_verdict": verdict,
+            "metrics": metrics,
+            "linked_evidence_ids": linked_ids,
+            "reportable": False,
+            "basis": basis,
+            "limitations": [
+                "该 JSON 只是确定性候选链路；最终语境解释、反证和串联由 evidence_cross_validation LLM 任务完成。"
+            ],
+        })
+    counts = Counter(item.get("candidate_verdict", "unverifiable") for item in validations)
+    return {
+        "schema_version": "evidence_cross_validation.v1",
+        "validations": validations,
+        "summary": {
+            "validation_count": len(validations),
+            "matched": counts.get("matched", 0),
+            "ambiguous": counts.get("ambiguous", 0),
+            "no_candidate": counts.get("no_candidate", 0),
+            "unverifiable": counts.get("unverifiable", 0),
+            "linked_to_deterministic_evidence": sum(
+                1 for item in validations if item.get("linked_evidence_ids")
+            ),
+        },
+        "reporting_rules": [
+            "LLM 可以基于该 seed 做论文语境定位、解释、反证和串联。",
+            "candidate_verdict=ambiguous/no_candidate/unverifiable 不能单独写成造假发现。",
+            "主要风险结论仍必须引用 deterministic_findings 中已有 evidence_id。",
+        ],
     }
 
 
@@ -1256,6 +1427,10 @@ def run_raw_data_precheck(
         }
         for item in evidence_for_context
     ]
+    paper_raw_data_alignment = compare_paper_stats_to_raw_data(paper_payload, datasets)
+    evidence_cross_validation = build_evidence_cross_validation_seed(
+        paper_raw_data_alignment, evidence_for_context
+    )
 
     return {
         "status": "success",
@@ -1263,7 +1438,8 @@ def run_raw_data_precheck(
         "deterministic_findings": evidence_for_context,
         "confidence_summary": confidence,
         "allowed_claims": allowed_claims,
-        "paper_raw_data_alignment": compare_paper_stats_to_raw_data(paper_payload, datasets),
+        "paper_raw_data_alignment": paper_raw_data_alignment,
+        "evidence_cross_validation": evidence_cross_validation,
         "warnings": warnings,
         "limitations": [
             "本次预检不执行任何图像取证、图像 OCR 或图像相似度分析。",
@@ -1303,6 +1479,30 @@ def format_raw_data_precheck_for_agent(precheck: dict[str, Any]) -> str:
                 f"  - 依据：{item.get('deterministic_basis')}",
                 f"  - 统计量：{stats_text}",
             ])
+    alignment = precheck.get("paper_raw_data_alignment") or {}
+    if alignment:
+        counts = alignment.get("counts", {})
+        lines.extend([
+            "",
+            "#### 论文统计值 ↔ XLSX 候选对齐",
+            f"- 论文 mean±SD 数量：{alignment.get('reported_mean_sd_count', 0)}",
+            f"- XLSX 可计算数据集数量：{alignment.get('raw_dataset_stats_count', 0)}",
+            "- 对齐计数："
+            f"matched={counts.get('matched', 0)}, ambiguous={counts.get('ambiguous', 0)}, "
+            f"no_candidate={counts.get('no_candidate', 0)}, "
+            f"unverifiable={counts.get('unverifiable', 0)}",
+            "- 注意：候选对齐用于帮助 LLM 回到论文语境定位、解释和反证；没有明确映射时不单独构成造假证据。",
+        ])
+    cross_validation = precheck.get("evidence_cross_validation") or {}
+    if cross_validation:
+        cv_summary = cross_validation.get("summary", {})
+        lines.extend([
+            "",
+            "#### 交叉验证 seed（供 LLM 语境回查）",
+            f"- validation_count={cv_summary.get('validation_count', 0)}",
+            f"- linked_to_deterministic_evidence={cv_summary.get('linked_to_deterministic_evidence', 0)}",
+            "- LLM 任务将基于该 seed 对已有 evidence_id 做论文位置定位、解释、反证和串联。",
+        ])
     if precheck.get("warnings"):
         lines.append("")
         lines.append("#### 覆盖范围警告")

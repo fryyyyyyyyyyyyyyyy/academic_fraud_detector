@@ -3,6 +3,7 @@ Paper fetching tools — search and retrieve paper metadata from
 arXiv, CrossRef, and Semantic Scholar APIs, or load from local PDF files.
 """
 
+import copy
 import json
 import os
 import logging
@@ -23,7 +24,14 @@ from ..utils.text_extraction import (
     extract_pdf_text,
     extract_pdf_images,
 )
-from ..utils.table_extraction import extract_pdf_tables, extract_numeric_values, extract_p_values, extract_means_and_sds
+from ..utils.table_extraction import (
+    extract_means_and_sds_with_sources,
+    extract_numeric_values,
+    extract_p_values,
+    extract_p_values_with_sources,
+    extract_paper_claims,
+    extract_pdf_tables,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -645,9 +653,11 @@ class LocalPaperLoaderTool(BaseTool):
             "mineru": {"used": False},
             "pre_extracted_stats": {
                 "p_values": [],
+                "p_value_records": [],
                 "means_and_sds": [],
                 "numeric_values": [],
             },
+            "paper_claims": {"schema_version": "paper_claims.v1", "claims": [], "summary": {}, "warnings": []},
             "error": None,
         }
 
@@ -679,11 +689,29 @@ class LocalPaperLoaderTool(BaseTool):
                     max_pages=max_pages,
                 )
 
-                # Pre-extract statistical values from text
-                result["pre_extracted_stats"]["p_values"] = [
-                    round(v, 6) for v in extract_p_values(full_text)
-                ]
-                result["pre_extracted_stats"]["means_and_sds"] = extract_means_and_sds(full_text)
+                # Pre-extract statistical values and source-bearing paper claim anchors.
+                extraction_method = "mineru_markdown" if mineru_meta.get("used") else "pymupdf_text"
+                result["pre_extracted_stats"]["p_values"] = extract_p_values(full_text)
+                result["pre_extracted_stats"]["p_value_records"] = extract_p_values_with_sources(
+                    full_text,
+                    document_role="main_pdf",
+                    file_name=result["file_name"],
+                    extraction_method=extraction_method,
+                )
+                result["pre_extracted_stats"]["means_and_sds"] = (
+                    extract_means_and_sds_with_sources(
+                        full_text,
+                        document_role="main_pdf",
+                        file_name=result["file_name"],
+                        extraction_method=extraction_method,
+                    )
+                )
+                result["paper_claims"] = extract_paper_claims(
+                    full_text,
+                    file_name=result["file_name"],
+                    document_role="main_pdf",
+                    extraction_method=extraction_method,
+                )
         except Exception as e:
             logger.warning(f"Text extraction failed: {e}")
             result["full_text"] = f"Text extraction error: {e}"
@@ -785,11 +813,14 @@ class LocalPaperLoaderTool(BaseTool):
                     supp_result = self._load_single_pdf(
                         supp_path, max_pages, extract_images, extract_tables, image_min_size
                     )
-                    # Merge statistics from supplementary files
+                    # Merge statistics from supplementary files. Keep the per-file
+                    # paper_claims copy intact; top-level merged claims get their own IDs.
+                    supp_paper_claims = copy.deepcopy(supp_result.get("paper_claims", {}))
                     result["supplementary_files"].append({
                         "file_path": supp_path,
                         "file_name": os.path.basename(supp_path),
                         "stats": supp_result.get("pre_extracted_stats", {}),
+                        "paper_claims": supp_paper_claims,
                         "tables": supp_result.get("tables", []),
                         "text_length": supp_result.get("full_text_length_chars", 0),
                         "image_output_dir": supp_result.get("image_output_dir"),
@@ -800,12 +831,50 @@ class LocalPaperLoaderTool(BaseTool):
                     result["pre_extracted_stats"]["p_values"].extend(
                         supp_stats.get("p_values", [])
                     )
+                    result["pre_extracted_stats"].setdefault("p_value_records", []).extend(
+                        supp_stats.get("p_value_records", [])
+                    )
                     result["pre_extracted_stats"]["means_and_sds"].extend(
                         supp_stats.get("means_and_sds", [])
                     )
                     result["pre_extracted_stats"]["numeric_values"].extend(
                         supp_stats.get("numeric_values", [])
                     )
+                    supp_claims = copy.deepcopy((supp_paper_claims or {}).get("claims", []))
+                    if supp_claims:
+                        result.setdefault(
+                            "paper_claims",
+                            {
+                                "schema_version": "paper_claims.v1",
+                                "claims": [],
+                                "summary": {},
+                                "warnings": [],
+                            },
+                        )
+                        result["paper_claims"].setdefault("claims", []).extend(supp_claims)
+                        for claim_index, claim in enumerate(result["paper_claims"]["claims"], start=1):
+                            claim["claim_id"] = f"PCL-{claim_index:04d}"
+                        claims = result["paper_claims"]["claims"]
+                        result["paper_claims"]["summary"] = {
+                            "claim_count": len(claims),
+                            "reported_stat_count": sum(
+                                1
+                                for claim in claims
+                                if claim.get("claim_type") in {"reported_mean_sd", "reported_p_value"}
+                            ),
+                            "reported_mean_sd_count": sum(
+                                1 for claim in claims if claim.get("claim_type") == "reported_mean_sd"
+                            ),
+                            "reported_p_value_count": sum(
+                                1 for claim in claims if claim.get("claim_type") == "reported_p_value"
+                            ),
+                            "reported_n_count": sum(
+                                1 for claim in claims if claim.get("claim_type") == "reported_n"
+                            ),
+                        }
+                        result["paper_claims"].setdefault("warnings", []).extend(
+                            (supp_paper_claims or {}).get("warnings", [])
+                        )
                     # Merge tables
                     result["tables"].extend(supp_result.get("tables", []))
                     # Merge panels if any
@@ -844,7 +913,6 @@ class LocalPaperLoaderTool(BaseTool):
         image_min_size: int,
     ) -> dict:
         """Load a single PDF and return its extracted content as a dict (no JSON)."""
-        from ..utils.table_extraction import extract_pdf_tables, extract_numeric_values, extract_p_values, extract_means_and_sds
         from ..utils.figure_splitter import extract_all_panels_from_images
 
         with open(file_path, "rb") as f:
@@ -862,9 +930,11 @@ class LocalPaperLoaderTool(BaseTool):
             "mineru": {"used": False},
             "pre_extracted_stats": {
                 "p_values": [],
+                "p_value_records": [],
                 "means_and_sds": [],
                 "numeric_values": [],
             },
+            "paper_claims": {"schema_version": "paper_claims.v1", "claims": [], "summary": {}, "warnings": []},
         }
 
         mineru_images: list[dict[str, Any]] = []
@@ -886,10 +956,31 @@ class LocalPaperLoaderTool(BaseTool):
                     pdf_bytes,
                     max_pages=max_pages,
                 )
+                extraction_method = "mineru_markdown" if mineru_meta.get("used") else "pymupdf_text"
+                file_name = os.path.basename(file_path)
                 result["pre_extracted_stats"]["p_values"] = [
                     round(v, 6) for v in extract_p_values(text)
                 ]
-                result["pre_extracted_stats"]["means_and_sds"] = extract_means_and_sds(text)
+                result["pre_extracted_stats"]["p_value_records"] = extract_p_values_with_sources(
+                    text,
+                    document_role="supplementary_pdf",
+                    file_name=file_name,
+                    extraction_method=extraction_method,
+                )
+                result["pre_extracted_stats"]["means_and_sds"] = (
+                    extract_means_and_sds_with_sources(
+                        text,
+                        document_role="supplementary_pdf",
+                        file_name=file_name,
+                        extraction_method=extraction_method,
+                    )
+                )
+                result["paper_claims"] = extract_paper_claims(
+                    text,
+                    file_name=file_name,
+                    document_role="supplementary_pdf",
+                    extraction_method=extraction_method,
+                )
         except Exception as e:
             logger.warning(f"Supp text extraction failed: {e}")
 

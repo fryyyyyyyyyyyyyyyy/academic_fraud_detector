@@ -414,6 +414,11 @@ class AcademicFraudDetectionCrew:
         return Task(config=self.tasks_config["data_integrity_investigation"])
 
     @task
+    def evidence_cross_validation(self) -> Task:
+        """Use the LLM to contextualize deterministic data evidence in the paper."""
+        return Task(config=self.tasks_config["evidence_cross_validation"])
+
+    @task
     def citation_network_investigation(self) -> Task:
         """Investigate the target paper's citation patterns."""
         return Task(config=self.tasks_config["citation_network_investigation"])
@@ -466,6 +471,7 @@ class AcademicFraudDetectionCrew:
             tasks = [
                 self.acquire_target_paper(),
                 self.data_integrity_investigation(),
+                self.evidence_cross_validation(),
                 self.methodology_audit(),
                 self.local_synthesize_findings(),
             ]
@@ -483,7 +489,11 @@ class AcademicFraudDetectionCrew:
             # Full mode: all tasks except plagiarism (disabled)
             tasks = [
                 t for t in self.tasks
-                if t.name != "plagiarism_investigation"
+                if t.name not in {
+                    "plagiarism_investigation",
+                    "evidence_cross_validation",
+                    "local_synthesize_findings",
+                }
             ]
             worker_agents = [a for a in self.agents if a.role != manager.role]
             logger.info(
@@ -552,6 +562,7 @@ class AcademicFraudDetectionCrew:
         """Build a compact statistics/extraction payload for data-audit tasks."""
         return {
             "pre_extracted_stats": payload.get("pre_extracted_stats", {}),
+            "paper_claims": payload.get("paper_claims", {}),
             "tables": payload.get("tables", []),
             "mineru": payload.get("mineru", {}),
             "page_count": payload.get("page_count", 0),
@@ -841,6 +852,7 @@ class AcademicFraudDetectionCrew:
             inputs["local_paper_stats_json"] = self._json_for_task(
                 self._local_paper_stats_payload(payload)
             )
+            inputs["paper_claims_json"] = self._json_for_task(payload.get("paper_claims", {}))
             inputs["local_paper_text"] = payload.get("full_text") or ""
             logger.info(
                 "Local PDF preload complete: %s chars text, %s tables, images disabled=%s",
@@ -859,6 +871,7 @@ class AcademicFraudDetectionCrew:
                 "panels": [],
                 "tables": [],
                 "pre_extracted_stats": {},
+                "paper_claims": {},
                 "mineru": {"used": False},
                 "error": str(e),
             }
@@ -872,6 +885,7 @@ class AcademicFraudDetectionCrew:
             inputs["local_paper_stats_json"] = self._json_for_task(
                 self._local_paper_stats_payload(payload)
             )
+            inputs["paper_claims_json"] = self._json_for_task(payload.get("paper_claims", {}))
             inputs["local_paper_text"] = ""
 
     def _inject_local_case_payload(self, inputs: dict, case_dir: str) -> None:
@@ -905,6 +919,12 @@ class AcademicFraudDetectionCrew:
             precheck.get("confidence_summary", {})
         )
         inputs["allowed_claims_json"] = self._json_for_task(precheck.get("allowed_claims", []))
+        inputs["paper_claims_json"] = self._json_for_task(
+            (inputs.get("local_paper_payload") or {}).get("paper_claims", {})
+        )
+        inputs["evidence_cross_validation_json"] = self._json_for_task(
+            precheck.get("evidence_cross_validation", {})
+        )
         logger.info(
             "Local case preload complete: %s XLSX files, %s datasets, %s evidence items",
             len(raw_paths),
@@ -995,6 +1015,8 @@ class AcademicFraudDetectionCrew:
         inputs.setdefault("deterministic_evidence_json", "[]")
         inputs.setdefault("confidence_summary_json", "{}")
         inputs.setdefault("allowed_claims_json", "[]")
+        inputs.setdefault("paper_claims_json", "{}")
+        inputs.setdefault("evidence_cross_validation_json", "{}")
 
         # ── Local deterministic preload/precheck ───────────────────────
         # 本地模式只做 PDF 文本/表格与 XLSX 原始数据预检，不执行图片、面板、OCR 或图像比对。

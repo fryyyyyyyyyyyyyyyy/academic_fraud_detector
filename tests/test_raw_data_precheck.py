@@ -1,6 +1,10 @@
 """原始数据确定性预检测试。"""
 
-from academic_fraud_detector.utils.raw_data_precheck import run_raw_data_precheck
+from academic_fraud_detector.utils.raw_data_precheck import (
+    compare_paper_stats_to_raw_data,
+    format_raw_data_precheck_for_agent,
+    run_raw_data_precheck,
+)
 
 
 def dataset(
@@ -320,3 +324,73 @@ def test_positionwise_pair_limit_returns_warning():
 
     assert warnings
     assert "仅比较前 1 对" in warnings[0]
+
+
+def test_compare_paper_stats_to_raw_data_reports_matched_alignment():
+    source = {
+        "file_path": "/tmp/source.xlsx",
+        "file_name": "source.xlsx",
+        "sheet": "Fig2",
+        "orientation": "column",
+        "range": "B2:B5",
+        "header": "IL-6",
+        "table_id": "source.xlsx::Fig2::B2:B5",
+        "table_range": "B2:B5",
+        "table_title": "Fig.2B",
+    }
+    raw_dataset = dataset("il6", [10.0, 12.0, 14.0, 16.0], source=source)
+    paper_payload = {
+        "paper_claims": {
+            "claims": [
+                {
+                    "claim_id": "PCL-0001",
+                    "claim_type": "reported_mean_sd",
+                    "values": {"mean": 13.0, "sd": 2.581988897},
+                    "raw_text": "13.0 ± 2.58",
+                    "source": {"page": 3, "section": "Results"},
+                }
+            ]
+        }
+    }
+
+    alignment = compare_paper_stats_to_raw_data(paper_payload, [raw_dataset])
+
+    assert alignment["counts"]["matched"] == 1
+    assert alignment["alignments"][0]["verdict"] == "matched"
+    candidate = alignment["alignments"][0]["candidate_matches"][0]
+    assert candidate["dataset"]["source_location"]["table_title"] == "Fig.2B"
+
+
+def test_run_raw_data_precheck_cross_validation_seed_does_not_expand_allowed_claims():
+    raw_dataset = dataset("reported", [10.0, 12.0, 14.0, 16.0])
+    paper_payload = {
+        "pre_extracted_stats": {
+            "means_and_sds": [{"mean": 99.0, "sd": 1.0, "context": "99.0 ± 1.0"}]
+        }
+    }
+
+    precheck = run_raw_data_precheck(
+        {"datasets": [raw_dataset], "profile": {"dataset_count": 1}},
+        paper_payload,
+    )
+
+    assert precheck["paper_raw_data_alignment"]["counts"]["no_candidate"] == 1
+    assert precheck["evidence_cross_validation"]["summary"]["validation_count"] == 1
+    assert all(
+        item["candidate_verdict"] != "no_candidate" or item["reportable"] is False
+        for item in precheck["evidence_cross_validation"]["validations"]
+    )
+    assert all("evidence_id" in item for item in precheck["allowed_claims"])
+
+
+def test_format_raw_data_precheck_includes_alignment_summary():
+    precheck = run_raw_data_precheck(
+        {"datasets": [dataset("raw", [1.0, 2.0, 3.0, 4.0])], "profile": {"dataset_count": 1}},
+        {"pre_extracted_stats": {"means_and_sds": [{"mean": 2.5, "sd": 1.290994449}]}},
+    )
+
+    text = format_raw_data_precheck_for_agent(precheck)
+
+    assert "论文统计值 ↔ XLSX 候选对齐" in text
+    assert "交叉验证 seed" in text
+    assert "不单独构成造假证据" in text

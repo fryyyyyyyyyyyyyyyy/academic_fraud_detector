@@ -38,6 +38,7 @@ def test_validate_inputs_preloads_local_pdf_without_images(tmp_path):
         "panels": [],
         "tables": [{"data": [["A", "B"]]}],
         "pre_extracted_stats": {"p_values": [0.031]},
+        "paper_claims": {"schema_version": "paper_claims.v1", "claims": [], "summary": {}},
         "mineru": {"used": True, "image_count": 0},
         "error": None,
         "_summary": "PDF loaded without images",
@@ -57,6 +58,7 @@ def test_validate_inputs_preloads_local_pdf_without_images(tmp_path):
     assert result["local_paper_load_status"] == "success"
     assert result["local_paper_images_json"] == "[]"
     assert result["local_paper_panels_json"] == "[]"
+    assert json.loads(result["paper_claims_json"])["schema_version"] == "paper_claims.v1"
     assert result["image_forensics_precheck_json"] == "{}"
     assert result["cross_figure_precheck_json"] == "{}"
     assert "不执行图像" in result["image_forensics_precheck"]
@@ -81,6 +83,11 @@ def test_validate_inputs_local_case_injects_raw_data_precheck(monkeypatch, tmp_p
         "panels": [],
         "tables": [],
         "pre_extracted_stats": {"means_and_sds": [{"mean": 12.3, "sd": 1.1}]},
+        "paper_claims": {
+            "schema_version": "paper_claims.v1",
+            "claims": [{"claim_id": "PCL-0001", "claim_type": "reported_mean_sd"}],
+            "summary": {"claim_count": 1},
+        },
         "mineru": {"used": False},
         "error": None,
         "_summary": "PDF loaded without images",
@@ -107,6 +114,11 @@ def test_validate_inputs_local_case_injects_raw_data_precheck(monkeypatch, tmp_p
             "deterministic_findings": [{"evidence_id": "E-0001"}],
             "confidence_summary": {"overall_risk": "high", "evidence_count": 1},
             "allowed_claims": [{"evidence_id": "E-0001", "claim": "test"}],
+            "evidence_cross_validation": {
+                "schema_version": "evidence_cross_validation.v1",
+                "summary": {"validation_count": 1},
+                "validations": [],
+            },
         },
     )
     monkeypatch.setattr(
@@ -128,6 +140,8 @@ def test_validate_inputs_local_case_injects_raw_data_precheck(monkeypatch, tmp_p
     assert result["raw_data_precheck"] == "raw precheck formatted"
     assert json.loads(result["deterministic_evidence_json"])[0]["evidence_id"] == "E-0001"
     assert json.loads(result["confidence_summary_json"])["overall_risk"] == "high"
+    assert json.loads(result["paper_claims_json"])["summary"]["claim_count"] == 1
+    assert json.loads(result["evidence_cross_validation_json"])["summary"]["validation_count"] == 1
     assert result["image_forensics_precheck_json"] == "{}"
     assert result["cross_figure_precheck_json"] == "{}"
 
@@ -147,3 +161,5 @@ def test_validate_inputs_non_local_keeps_default_payload_fields():
     assert result["local_paper_load_status"] == "not_applicable"
     assert result["raw_data_precheck_json"] == "{}"
     assert result["deterministic_evidence_json"] == "[]"
+    assert result["paper_claims_json"] == "{}"
+    assert result["evidence_cross_validation_json"] == "{}"
